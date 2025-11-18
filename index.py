@@ -7,9 +7,10 @@ import re
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
+# ЭТИ ПЕРЕМЕННЫЕ ДОЛЖНЫ БЫТЬ УСТАНОВЛЕНЫ НА RENDER
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') # Ваш чат ID для уведомлений
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 CHECKOUT_URL = "https://oops-merch.ru/checkout"
@@ -30,7 +31,6 @@ def create_psql_connection():
     conn.autocommit = True
     return conn
 
-# (Остальные DB функции не меняются, но включены в полный файл для целостности)
 def execute_db_command(query, params, conn, fetch=False):
     cursor = conn.cursor()
     cursor.execute(query, params)
@@ -190,11 +190,10 @@ def handle_contact_share(conn, update):
 
 def handle_check_submission(conn, update):
     try:
-        # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ
-        # Это должно быть безопасно, так как data/update уже проверены в application
-        message: Dict[str, Any] = update.get('message', {})
-        chat_id = message.get('chat', {}).get('id')
-        user_tg_id = message.get('from', {}).get('id')
+        # Прямой доступ к данным, предполагая, что update — это словарь (проверено в application)
+        message: Dict[str, Any] = update['message']
+        chat_id = message['chat']['id']
+        user_tg_id = message['from']['id']
         
         # 1. Проверяем наличие активного заказа
         order_data = get_order_by_tg_id(conn, user_tg_id)
@@ -271,10 +270,22 @@ def handle_check_submission(conn, update):
             # Если пришел не файл (текст, стикер и т.д.)
             send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате.")
 
+    except KeyError as e:
+        # Ловим ошибку, если в message нет нужных ключей
+        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА (KeyError) в handle_check_submission: {e}")
+        try:
+             send_message(message['chat']['id'], "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате, а не текст или стикер.")
+        except:
+             pass
     except Exception as e:
+        # Лог с точным местом сбоя
         error_message = f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_check_submission: {e}"
         print(error_message)
-        send_message(chat_id, f"❌ Ошибка сервера при обработке чека: {e}")
+        # Отправляем пользователю сообщение об ошибке
+        try:
+             send_message(chat_id, f"❌ Ошибка сервера при обработке чека: {e}")
+        except:
+             pass
 
 def handle_callback_query(conn, update):
     callback_query = update['callback_query']
@@ -347,7 +358,6 @@ def application(environ, start_response):
             
             try:
                 # ОЧЕНЬ ВАЖНО: Пытаемся декодировать JSON. Если не получается, data остается пустым словарем {}.
-                # Это предотвращает ошибку "'str' object has no attribute 'get'".
                 data = json.loads(request_body.decode('utf-8'))
             except json.JSONDecodeError:
                 print("DEBUG: Не удалось декодировать тело запроса в JSON.")
