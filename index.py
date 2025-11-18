@@ -194,10 +194,12 @@ def handle_contact_share(conn, update):
         send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения.")
 
 def handle_check_submission(conn, update):
-    message = update['message']
-    chat_id = message['chat']['id']
-    user_tg_id = message['from']['id']
+    # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ СЛОВАРЕЙ (ИСПРАВЛЕНИЕ ОШИБКИ)
+    message = update.get('message', {})
+    chat_id = message.get('chat', {}).get('id')
+    user_tg_id = message.get('from', {}).get('id')
     
+    # 1. Проверяем наличие активного заказа
     order_data = get_order_by_tg_id(conn, user_tg_id)
 
     if not order_data:
@@ -208,7 +210,10 @@ def handle_check_submission(conn, update):
     
     file_id = None
     file_type = None
+    
+    # 2. Логика парсинга файла
     if 'photo' in message:
+        # Получаем самую большую версию фото (последний элемент массива)
         file_id = message['photo'][-1]['file_id']
         file_type = 'photo'
     elif 'document' in message:
@@ -265,7 +270,8 @@ def handle_check_submission(conn, update):
         send_message(chat_id, "⏳ Ваш чек получен. Ожидайте подтверждения оплаты администратором.")
 
     else:
-        send_message(chat_id, "⚠️ Ошибка при обработке чека. Попробуйте еще раз.")
+        # Если пришел не файл (текст, стикер и т.д.)
+        send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате.")
 
 def handle_callback_query(conn, update):
     callback_query = update['callback_query']
@@ -294,6 +300,7 @@ def handle_callback_query(conn, update):
             new_caption += f"❌ ОТКЛОНЕНО. Отклонил: {admin_id}"
             user_msg = f"❌ Оплата отклонена. Пожалуйста, свяжитесь с администратором."
         
+        # Обновляем сообщение администратора, убирая кнопки
         send_tg_request('editMessageCaption', {
             'chat_id': message['chat']['id'],
             'message_id': message['message_id'],
@@ -302,6 +309,7 @@ def handle_callback_query(conn, update):
             'reply_markup': {"inline_keyboard": []}
         })
         
+        # Отправляем уведомление пользователю
         order_data = get_order_by_token(conn, order_token)
         if order_data and order_data[4]: 
             send_message(order_data[4], user_msg)
@@ -334,8 +342,10 @@ def application(environ, start_response):
             request_body = environ['wsgi.input'].read(content_length)
             
             try:
+                # Пытаемся декодировать JSON. Telegram webhook и запрос с сайта - JSON.
                 data = json.loads(request_body.decode('utf-8'))
             except json.JSONDecodeError:
+                # Если это не JSON, то это может быть другая форма данных, но для наших целей оставляем пустым
                 data = {} 
 
             # --- A. ОБРАБОТКА ЗАКАЗА С САЙТА (POST /) ---
@@ -359,7 +369,7 @@ def application(environ, start_response):
                 return [response_data]
 
             # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (POST /tgwebhook) ---
-            elif path.startswith('/tgwebhook') or ('update_id' in data and 'message' in data): 
+            elif path.startswith('/tgwebhook'): # Telegram Webhook должен приходить сюда
                 update = data 
                 
                 if 'message' in update:
@@ -370,6 +380,9 @@ def application(environ, start_response):
                         handle_contact_share(conn, update)
                     elif 'photo' in message or 'document' in message:
                         handle_check_submission(conn, update)
+                    else: # Обработка любого другого текста/стикера, который не является чеком
+                        send_message(message['chat']['id'], "Я ожидаю фотографию (чек) или команду /start.")
+
                 elif 'callback_query' in update:
                     handle_callback_query(conn, update)
                 
