@@ -113,6 +113,7 @@ def send_tg_request(method, payload):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
+        # Логируем 403, 404 и другие ошибки API Telegram
         print(f"Telegram API Error ({method}): {e}")
         return None
 
@@ -122,7 +123,7 @@ def send_message(chat_id, text, reply_markup=None):
         payload['reply_markup'] = reply_markup
     return send_tg_request('sendMessage', payload)
 
-# --- ОБРАБОТЧИКИ TELEGRAM (С ЛОГИРОВАНИЕМ) ---
+# --- ОБРАБОТЧИКИ TELEGRAM ---
 
 def handle_start(conn, update):
     message = update['message']
@@ -132,7 +133,6 @@ def handle_start(conn, update):
     
     print(f"DEBUG: handle_start получил сообщение от {user_tg_id}: {text}")
 
-    # 1. Парсим токен из команды /start
     match = re.search(r'/start\s+(\w+)', text)
     order_token = match.group(1) if match else None
     
@@ -140,13 +140,11 @@ def handle_start(conn, update):
     
     if order_token:
         try:
-            # Привязываем ID пользователя к заказу и обновляем статус
             updated = update_order_status_and_user(conn, order_token, 'pending_phone_auth', user_tg_id=user_tg_id)
             
             print(f"DEBUG: Обновление БД для {order_token}. Статус: {updated}")
 
             if updated:
-                # Отправляем клавиатуру для запроса номера телефона
                 keyboard = {
                     "keyboard": [[{"text": "Подтвердить номер телефона", "request_contact": True}]],
                     "one_time_keyboard": True,
@@ -163,7 +161,6 @@ def handle_start(conn, update):
                 print("DEBUG: Отправлена ошибка 'Заказ не найден'.")
                 
         except Exception as e:
-            # Ловим ошибку базы данных или другую критическую ошибку в процессе
             error_message = f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_start: {e}"
             print(error_message)
             send_message(chat_id, f"❌ Критическая ошибка сервера: Пожалуйста, свяжитесь с администратором.")
@@ -194,84 +191,94 @@ def handle_contact_share(conn, update):
         send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения.")
 
 def handle_check_submission(conn, update):
-    # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ ИЗ СЛОВАРЕЙ (ИСПРАВЛЕНИЕ ОШИБКИ)
-    message = update.get('message', {})
-    chat_id = message.get('chat', {}).get('id')
-    user_tg_id = message.get('from', {}).get('id')
-    
-    # 1. Проверяем наличие активного заказа
-    order_data = get_order_by_tg_id(conn, user_tg_id)
-
-    if not order_data:
-        send_message(chat_id, "⚠️ У вас нет активного заказа, ожидающего оплаты.")
-        return
-
-    order_token = order_data[0]
-    
-    file_id = None
-    file_type = None
-    
-    # 2. Логика парсинга файла
-    if 'photo' in message:
-        # Получаем самую большую версию фото (последний элемент массива)
-        file_id = message['photo'][-1]['file_id']
-        file_type = 'photo'
-    elif 'document' in message:
-        file_id = message['document']['file_id']
-        file_type = 'document'
-    
-    if file_id:
-        update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
+    # ИСПОЛЬЗУЕМ try/except ДЛЯ ПОЛНОГО ОТСЛЕЖИВАНИЯ СБОЯ В ЭТОЙ КРИТИЧЕСКОЙ ФУНКЦИИ
+    try:
+        # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ (ИСПРАВЛЕНИЕ ОШИБКИ)
+        message = update.get('message', {})
+        chat_id = message.get('chat', {}).get('id')
+        user_tg_id = message.get('from', {}).get('id')
         
-        full_order_data = get_order_by_token(conn, order_token)
-        cart = json.loads(full_order_data[2])
-        total_amount = sum(item.get('price', 0) * item.get('quantity', 1) for item in cart)
+        # 1. Проверяем наличие активного заказа
+        order_data = get_order_by_tg_id(conn, user_tg_id)
 
-        admin_message = (
-            f"🔔 *НОВЫЙ ЗАКАЗ*\n"
-            f"Токен: `{order_token}`\n"
-            f"Телефон: `{full_order_data[3] or 'Нет данных'}`\n"
-            f"Сумма: **{total_amount}** руб.\n\n"
-            f"*Состав заказа:*\n"
-        )
-        for item in cart:
-            admin_message += f"— {item.get('name', 'Товар')} ({item.get('size', '-')}) x{item.get('quantity', 1)}\n"
+        if not order_data:
+            send_message(chat_id, "⚠️ У вас нет активного заказа, ожидающего оплаты.")
+            return
+
+        order_token = order_data[0]
         
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "✅ Оплата подтверждена", "callback_data": f"CONFIRM_{order_token}"}],
-                [{"text": "❌ Отклонить оплату", "callback_data": f"REJECT_{order_token}"}]
-            ]
-        }
+        file_id = None
+        file_type = None
         
-        if file_type == 'photo':
-            send_tg_request(
-                'sendPhoto',
-                {
-                    'chat_id': ADMIN_CHAT_ID,
-                    'photo': file_id,
-                    'caption': admin_message,
-                    'parse_mode': 'Markdown',
-                    'reply_markup': keyboard
-                }
+        # 2. Логика парсинга файла
+        if 'photo' in message:
+            # Получаем самую большую версию фото (последний элемент массива)
+            file_id = message['photo'][-1]['file_id']
+            file_type = 'photo'
+        elif 'document' in message:
+            file_id = message['document']['file_id']
+            file_type = 'document'
+        
+        if file_id:
+            update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
+            
+            full_order_data = get_order_by_token(conn, order_token)
+            cart = json.loads(full_order_data[2])
+            total_amount = sum(item.get('price', 0) * item.get('quantity', 1) for item in cart)
+
+            admin_message = (
+                f"🔔 *НОВЫЙ ЗАКАЗ*\n"
+                f"Токен: `{order_token}`\n"
+                f"Телефон: `{full_order_data[3] or 'Нет данных'}`\n"
+                f"Сумма: **{total_amount}** руб.\n\n"
+                f"*Состав заказа:*\n"
             )
-        elif file_type == 'document':
-             send_tg_request(
-                'sendDocument',
-                {
-                    'chat_id': ADMIN_CHAT_ID,
-                    'document': file_id,
-                    'caption': admin_message,
-                    'parse_mode': 'Markdown',
-                    'reply_markup': keyboard
-                }
-            )
-        
-        send_message(chat_id, "⏳ Ваш чек получен. Ожидайте подтверждения оплаты администратором.")
+            for item in cart:
+                admin_message += f"— {item.get('name', 'Товар')} ({item.get('size', '-')}) x{item.get('quantity', 1)}\n"
+            
+            keyboard = {
+                "inline_keyboard": [
+                    [{"text": "✅ Оплата подтверждена", "callback_data": f"CONFIRM_{order_token}"}],
+                    [{"text": "❌ Отклонить оплату", "callback_data": f"REJECT_{order_token}"}]
+                ]
+            }
+            
+            # Отправка уведомления администратору
+            if file_type == 'photo':
+                send_tg_request(
+                    'sendPhoto',
+                    {
+                        'chat_id': ADMIN_CHAT_ID,
+                        'photo': file_id,
+                        'caption': admin_message,
+                        'parse_mode': 'Markdown',
+                        'reply_markup': keyboard
+                    }
+                )
+            elif file_type == 'document':
+                 send_tg_request(
+                    'sendDocument',
+                    {
+                        'chat_id': ADMIN_CHAT_ID,
+                        'document': file_id,
+                        'caption': admin_message,
+                        'parse_mode': 'Markdown',
+                        'reply_markup': keyboard
+                    }
+                )
+            
+            send_message(chat_id, "⏳ Ваш чек получен. Ожидайте подтверждения оплаты администратором.")
 
-    else:
-        # Если пришел не файл (текст, стикер и т.д.)
-        send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате.")
+        else:
+            # Если пришел не файл (текст, стикер и т.д.)
+            send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате.")
+
+    except Exception as e:
+        # Лог с точным местом сбоя
+        error_message = f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_check_submission: {e}"
+        print(error_message)
+        # Отправляем пользователю сообщение об ошибке, чтобы он не видел "молчания"
+        send_message(chat_id, f"❌ Ошибка сервера при обработке чека: {e}")
 
 def handle_callback_query(conn, update):
     callback_query = update['callback_query']
@@ -342,10 +349,8 @@ def application(environ, start_response):
             request_body = environ['wsgi.input'].read(content_length)
             
             try:
-                # Пытаемся декодировать JSON. Telegram webhook и запрос с сайта - JSON.
                 data = json.loads(request_body.decode('utf-8'))
             except json.JSONDecodeError:
-                # Если это не JSON, то это может быть другая форма данных, но для наших целей оставляем пустым
                 data = {} 
 
             # --- A. ОБРАБОТКА ЗАКАЗА С САЙТА (POST /) ---
@@ -358,7 +363,6 @@ def application(environ, start_response):
 
                 save_order_to_db(conn, order_token, cart_data)
                 
-                # Используем правильное имя бота, которое должно быть в env
                 deep_link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}'
                 response_data = json.dumps({'deep_link': deep_link}).encode('utf-8')
                 
@@ -369,7 +373,7 @@ def application(environ, start_response):
                 return [response_data]
 
             # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (POST /tgwebhook) ---
-            elif path.startswith('/tgwebhook'): # Telegram Webhook должен приходить сюда
+            elif path.startswith('/tgwebhook'):
                 update = data 
                 
                 if 'message' in update:
@@ -378,10 +382,9 @@ def application(environ, start_response):
                         handle_start(conn, update)
                     elif 'contact' in message:
                         handle_contact_share(conn, update)
-                    elif 'photo' in message or 'document' in message:
+                    # Если сообщение содержит фото, документ, или любой другой контент
+                    elif 'photo' in message or 'document' in message or 'text' in message or 'sticker' in message:
                         handle_check_submission(conn, update)
-                    else: # Обработка любого другого текста/стикера, который не является чеком
-                        send_message(message['chat']['id'], "Я ожидаю фотографию (чек) или команду /start.")
 
                 elif 'callback_query' in update:
                     handle_callback_query(conn, update)
