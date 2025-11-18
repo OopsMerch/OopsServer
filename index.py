@@ -12,7 +12,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') # Ваш чат ID для уведомлений
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
-# ИСПОЛЬЗУЕМ ВАШ ДОМЕН ДЛЯ ВОЗВРАТА ПОЛЬЗОВАТЕЛЯ (если потребуется)
+# ИСПОЛЬЗУЕМ ВАШ ДОМЕН ДЛЯ ВОЗВРАТА ПОЛЬЗОВАТЕЛЯ
 CHECKOUT_URL = "https://oops-merch.ru/checkout"
 
 ORDERS_TABLE_NAME = 'orders'
@@ -122,7 +122,7 @@ def send_message(chat_id, text, reply_markup=None):
         payload['reply_markup'] = reply_markup
     return send_tg_request('sendMessage', payload)
 
-# --- ОБРАБОТЧИКИ TELEGRAM ---
+# --- ОБРАБОТЧИКИ TELEGRAM (С ЛОГИРОВАНИЕМ) ---
 
 def handle_start(conn, update):
     message = update['message']
@@ -130,27 +130,48 @@ def handle_start(conn, update):
     user_tg_id = message['from']['id']
     text = message['text']
     
+    print(f"DEBUG: handle_start получил сообщение от {user_tg_id}: {text}")
+
+    # 1. Парсим токен из команды /start
     match = re.search(r'/start\s+(\w+)', text)
     order_token = match.group(1) if match else None
     
+    print(f"DEBUG: Разобранный токен: {order_token}")
+    
     if order_token:
-        updated = update_order_status_and_user(conn, order_token, 'pending_phone_auth', user_tg_id=user_tg_id)
+        try:
+            # Привязываем ID пользователя к заказу и обновляем статус
+            updated = update_order_status_and_user(conn, order_token, 'pending_phone_auth', user_tg_id=user_tg_id)
+            
+            print(f"DEBUG: Обновление БД для {order_token}. Статус: {updated}")
 
-        if updated:
-            keyboard = {
-                "keyboard": [[{"text": "Подтвердить номер телефона", "request_contact": True}]],
-                "one_time_keyboard": True,
-                "resize_keyboard": True
-            }
-            send_message(
-                chat_id, 
-                "✅ Заказ найден. Для продолжения оформления заказа, пожалуйста, подтвердите свой номер телефона, нажав на кнопку ниже:", 
-                reply_markup=keyboard
-            )
-        else:
-            send_message(chat_id, "⚠️ Ошибка: Заказ не найден или уже обработан.")
+            if updated:
+                # Отправляем клавиатуру для запроса номера телефона
+                keyboard = {
+                    "keyboard": [[{"text": "Подтвердить номер телефона", "request_contact": True}]],
+                    "one_time_keyboard": True,
+                    "resize_keyboard": True
+                }
+                send_message(
+                    chat_id, 
+                    "✅ Заказ найден. Для продолжения оформления заказа, пожалуйста, подтвердите свой номер телефона, нажав на кнопку ниже:", 
+                    reply_markup=keyboard
+                )
+                print("DEBUG: Сообщение об успехе отправлено.")
+            else:
+                send_message(chat_id, "⚠️ Ошибка: Заказ не найден или уже обработан.")
+                print("DEBUG: Отправлена ошибка 'Заказ не найден'.")
+                
+        except Exception as e:
+            # Ловим ошибку базы данных или другую критическую ошибку в процессе
+            error_message = f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_start: {e}"
+            print(error_message)
+            send_message(chat_id, f"❌ Критическая ошибка сервера: Пожалуйста, свяжитесь с администратором.")
+            
     else:
          send_message(chat_id, "Привет! Используйте ссылку с сайта, чтобы начать оформление заказа.")
+         print("DEBUG: Отправлено общее сообщение /start.")
+
 
 def handle_contact_share(conn, update):
     message = update['message']
@@ -163,10 +184,8 @@ def handle_contact_share(conn, update):
     if order_data:
         order_token = order_data[0]
         
-        # Обновляем статус: ждем чек
         update_order_status_and_user(conn, order_token, 'pending_payment_check', phone_number=phone_number)
         
-        # Пропускаем возврат на сайт и сразу запрашиваем чек
         send_message(
             chat_id, 
             f"✅ Номер **{phone_number}** подтвержден. Теперь пришлите фотографию (чек) об оплате."
@@ -197,7 +216,6 @@ def handle_check_submission(conn, update):
         file_type = 'document'
     
     if file_id:
-        # Обновляем статус: ждем подтверждения от админа
         update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
         
         full_order_data = get_order_by_token(conn, order_token)
@@ -330,6 +348,7 @@ def application(environ, start_response):
 
                 save_order_to_db(conn, order_token, cart_data)
                 
+                # Используем правильное имя бота, которое должно быть в env
                 deep_link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}'
                 response_data = json.dumps({'deep_link': deep_link}).encode('utf-8')
                 
@@ -340,7 +359,6 @@ def application(environ, start_response):
                 return [response_data]
 
             # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (POST /tgwebhook) ---
-            # Render часто направляет Webhook на корень / , поэтому мы используем проверку данных
             elif path.startswith('/tgwebhook') or ('update_id' in data and 'message' in data): 
                 update = data 
                 
