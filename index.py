@@ -113,7 +113,6 @@ def send_tg_request(method, payload):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        # Логируем 403, 404 и другие ошибки API Telegram
         print(f"Telegram API Error ({method}): {e}")
         return None
 
@@ -191,9 +190,9 @@ def handle_contact_share(conn, update):
         send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения.")
 
 def handle_check_submission(conn, update):
-    # ИСПОЛЬЗУЕМ try/except ДЛЯ ПОЛНОГО ОТСЛЕЖИВАНИЯ СБОЯ В ЭТОЙ КРИТИЧЕСКОЙ ФУНКЦИИ
+    # Добавляем try/except для отлова ошибки в этой конкретной функции
     try:
-        # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ (ИСПРАВЛЕНИЕ ОШИБКИ)
+        # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ
         message = update.get('message', {})
         chat_id = message.get('chat', {}).get('id')
         user_tg_id = message.get('from', {}).get('id')
@@ -349,31 +348,35 @@ def application(environ, start_response):
             request_body = environ['wsgi.input'].read(content_length)
             
             try:
+                # Пытаемся декодировать JSON для ВСЕХ POST-запросов
                 data = json.loads(request_body.decode('utf-8'))
             except json.JSONDecodeError:
                 data = {} 
+                print("DEBUG: Не удалось декодировать тело запроса в JSON.")
+
 
             # --- A. ОБРАБОТКА ЗАКАЗА С САЙТА (POST /) ---
             if path == '/':
-                if not data:
-                    raise ValueError("Тело запроса не содержит JSON данных.")
+                # Проверка, что это действительно данные корзины
+                if data and any(key in data for key in ['items', 'cart_data', 'total']):
+                    
+                    cart_data = data
+                    order_token = str(uuid.uuid4()).replace('-', '')[:16] 
 
-                cart_data = data
-                order_token = str(uuid.uuid4()).replace('-', '')[:16] 
+                    save_order_to_db(conn, order_token, cart_data)
+                    
+                    deep_link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}'
+                    response_data = json.dumps({'deep_link': deep_link}).encode('utf-8')
+                    
+                    response_headers = CORS_HEADERS + [('Content-Type', 'application/json'), 
+                                                       ('Content-Length', str(len(response_data)))]
 
-                save_order_to_db(conn, order_token, cart_data)
-                
-                deep_link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}'
-                response_data = json.dumps({'deep_link': deep_link}).encode('utf-8')
-                
-                response_headers = CORS_HEADERS + [('Content-Type', 'application/json'), 
-                                                   ('Content-Length', str(len(response_data)))]
-
-                start_response('200 OK', response_headers)
-                return [response_data]
+                    start_response('200 OK', response_headers)
+                    return [response_data]
 
             # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (POST /tgwebhook) ---
-            elif path.startswith('/tgwebhook'):
+            # Обрабатывает запросы, пришедшие на /tgwebhook, или запросы с Telegram на /
+            if path.startswith('/tgwebhook') or ('update_id' in data and 'message' in data): 
                 update = data 
                 
                 if 'message' in update:
@@ -382,7 +385,6 @@ def application(environ, start_response):
                         handle_start(conn, update)
                     elif 'contact' in message:
                         handle_contact_share(conn, update)
-                    # Если сообщение содержит фото, документ, или любой другой контент
                     elif 'photo' in message or 'document' in message or 'text' in message or 'sticker' in message:
                         handle_check_submission(conn, update)
 
@@ -392,6 +394,7 @@ def application(environ, start_response):
                 start_response('200 OK', [('Content-type', 'text/plain')])
                 return [b'OK']
 
+            # Если это POST-запрос на / или /tgwebhook, который не был обработан выше
             else:
                 start_response('404 Not Found', [('Content-type', 'text/plain')])
                 return [b'Not Found']
