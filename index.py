@@ -4,17 +4,15 @@ import uuid
 import psycopg2 
 import requests 
 import re 
+from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
-# ЭТИ ПЕРЕМЕННЫЕ ДОЛЖНЫ БЫТЬ УСТАНОВЛЕНЫ НА RENDER
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') # Ваш чат ID для уведомлений
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
-# ИСПОЛЬЗУЕМ ВАШ ДОМЕН ДЛЯ ВОЗВРАТА ПОЛЬЗОВАТЕЛЯ
 CHECKOUT_URL = "https://oops-merch.ru/checkout"
-
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
 CORS_HEADERS = [
@@ -32,6 +30,7 @@ def create_psql_connection():
     conn.autocommit = True
     return conn
 
+# (Остальные DB функции не меняются, но включены в полный файл для целостности)
 def execute_db_command(query, params, conn, fetch=False):
     cursor = conn.cursor()
     cursor.execute(query, params)
@@ -190,10 +189,10 @@ def handle_contact_share(conn, update):
         send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения.")
 
 def handle_check_submission(conn, update):
-    # Добавляем try/except для отлова ошибки в этой конкретной функции
     try:
         # ИСПОЛЬЗУЕМ .get() ДЛЯ БЕЗОПАСНОГО ИЗВЛЕЧЕНИЯ ДАННЫХ
-        message = update.get('message', {})
+        # Это должно быть безопасно, так как data/update уже проверены в application
+        message: Dict[str, Any] = update.get('message', {})
         chat_id = message.get('chat', {}).get('id')
         user_tg_id = message.get('from', {}).get('id')
         
@@ -210,11 +209,11 @@ def handle_check_submission(conn, update):
         file_type = None
         
         # 2. Логика парсинга файла
-        if 'photo' in message:
+        if 'photo' in message and message['photo']:
             # Получаем самую большую версию фото (последний элемент массива)
             file_id = message['photo'][-1]['file_id']
             file_type = 'photo'
-        elif 'document' in message:
+        elif 'document' in message and message['document']:
             file_id = message['document']['file_id']
             file_type = 'document'
         
@@ -273,10 +272,8 @@ def handle_check_submission(conn, update):
             send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек) об оплате.")
 
     except Exception as e:
-        # Лог с точным местом сбоя
         error_message = f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_check_submission: {e}"
         print(error_message)
-        # Отправляем пользователю сообщение об ошибке, чтобы он не видел "молчания"
         send_message(chat_id, f"❌ Ошибка сервера при обработке чека: {e}")
 
 def handle_callback_query(conn, update):
@@ -346,18 +343,21 @@ def application(environ, start_response):
             
             content_length = int(environ.get('CONTENT_LENGTH', '0'))
             request_body = environ['wsgi.input'].read(content_length)
+            data = {}
             
             try:
-                # Пытаемся декодировать JSON для ВСЕХ POST-запросов
+                # ОЧЕНЬ ВАЖНО: Пытаемся декодировать JSON. Если не получается, data остается пустым словарем {}.
+                # Это предотвращает ошибку "'str' object has no attribute 'get'".
                 data = json.loads(request_body.decode('utf-8'))
             except json.JSONDecodeError:
-                data = {} 
                 print("DEBUG: Не удалось декодировать тело запроса в JSON.")
+            except UnicodeDecodeError as e:
+                print(f"DEBUG: Ошибка декодирования Юникода: {e}")
 
 
             # --- A. ОБРАБОТКА ЗАКАЗА С САЙТА (POST /) ---
             if path == '/':
-                # Проверка, что это действительно данные корзины
+                # Проверяем, похоже ли data на корзину (содержит ключи, связанные с заказом)
                 if data and any(key in data for key in ['items', 'cart_data', 'total']):
                     
                     cart_data = data
@@ -385,6 +385,7 @@ def application(environ, start_response):
                         handle_start(conn, update)
                     elif 'contact' in message:
                         handle_contact_share(conn, update)
+                    # Финальная проверка для обработки контента (чек, текст, стикер)
                     elif 'photo' in message or 'document' in message or 'text' in message or 'sticker' in message:
                         handle_check_submission(conn, update)
 
