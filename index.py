@@ -4,6 +4,9 @@ import uuid
 import psycopg2 
 import requests 
 import re 
+import hmac # <-- НОВЫЙ ИМПОРТ
+import hashlib # <-- НОВЫЙ ИМПОРТ
+from urllib.parse import parse_qsl # <-- НОВЫЙ ИМПОРТ
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
@@ -12,16 +15,56 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
-CHECKOUT_URL = "https://oops-merch.ru/checkout"
+# !!! ВАЖНАЯ ПЕРЕМЕННАЯ (Для редиректа после авторизации)
+# Используется переменная окружения, которую вы должны установить на Render!
+SITE_BASE_URL = os.environ.get('SITE_BASE_URL', 'https://oops-merch.ru') 
+
+# Адрес вашего сервера, который вы мне указали:
+SERVER_AUTH_URL = "https://oopsserver.onrender.com" 
+
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
-    ('Access-Control-Allow-Methods', 'POST, OPTIONS'), 
+    ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), # Добавлен GET
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
+# --- ФУНКЦИИ ПРОВЕРКИ АВТОРИЗАЦИИ TELEGRAM ---
+
+def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
+    """Проверяет подлинность данных, присланных Telegram, используя BOT_TOKEN."""
+    if not auth_data or 'hash' not in auth_data or not TELEGRAM_BOT_TOKEN:
+        print("DEBUG: Недостаточно данных или отсутствует BOT_TOKEN.")
+        return False
+
+    # 1. Сортируем параметры и формируем строку
+    data_list = []
+    for key, value in auth_data.items():
+        if key != 'hash':
+            data_list.append(f"{key}={value}")
+    
+    data_list.sort()
+    data_check_string = '\n'.join(data_list)
+    
+    # 2. Вычисляем секретный ключ (HMAC_KEY)
+    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode('utf-8')).digest()
+
+    # 3. Вычисляем хэш подписи (HMAC-SHA256)
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+
+    # 4. Сравниваем
+    is_valid = calculated_hash == auth_data['hash']
+    if not is_valid:
+        print(f"DEBUG: Ошибка хэша: Ожидается {auth_data['hash']}, Вычислено {calculated_hash}")
+    return is_valid
+
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
+# ... (оставьте остальные функции базы данных без изменений)
 
 def create_psql_connection():
     if not DATABASE_URL:
@@ -334,14 +377,42 @@ def application(environ, start_response):
             # A. ЗАКАЗ С САЙТА
             if path == '/':
                 cart_data = data.get('items', data)
-                order_token = str(uuid.uuid4()).replace('-', '')[:16] 
-                save_order_to_db(conn, order_token, cart_data)
                 
-                deep_link = f'https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}'
-                resp = json.dumps({'deep_link': deep_link}).encode('utf-8')
+                # --- НОВАЯ ЛОГИКА ДЛЯ ПОЛНОЙ ФОРМЫ (с user_tg_id) ---
+                user_tg_id = data.get('telegram_user_id') 
+                
+                order_token = str(uuid.uuid4()).replace('-', '')[:16] 
+                # !!! ВНИМАНИЕ: Здесь должна быть более сложная логика сохранения всех данных формы (ФИО, Адрес и т.д.)
+                # Я сохраняю только ID Telegram, как было в вашем старом коде
+                
+                # Обновление: Сохраняем все данные, если они пришли
+                full_order_data = {
+                    'items': cart_data,
+                    'full_name': data.get('full_name'),
+                    'phone': data.get('phone'),
+                    'email': data.get('email'),
+                    'delivery_address': data.get('delivery_address'),
+                    'comment': data.get('comment')
+                }
+                
+                # Ищем order_token в списке, чтобы обновить, но по логике сайта - это всегда новый заказ.
+                # Поэтому просто сохраняем новый заказ с ID пользователя.
+                
+                cursor = conn.cursor()
+                query = f"""
+                INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data, user_tg_id, phone_number)
+                VALUES (%s, %s, %s, %s, %s)
+                """
+                # Сохраняем телефон и tg_id сразу, если они есть
+                cursor.execute(query, (order_token, "pending_payment_check", json.dumps(full_order_data), user_tg_id, full_order_data.get('phone')))
+                cursor.close()
+                
+                # Отправка администратору о новом заказе (можно добавить сюда!)
+
+                resp = json.dumps({'success': True, 'message': 'Order processed'}).encode('utf-8')
                 start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
                 return [resp]
-
+                
             # B. TELEGRAM WEBHOOK (/newhook)
             if path.startswith('/newhook') and data: 
                 if 'message' in data:
@@ -362,9 +433,61 @@ def application(environ, start_response):
             return [b'Not Found']
 
         elif method == 'GET':
+            path = environ.get('PATH_INFO', '/')
+            
+            # 1. ОБРАБОТЧИК АВТОРИЗАЦИИ TELEGRAM (НОВЫЙ)
+            if path == '/tg-login-callback':
+                query_string = environ.get('QUERY_STRING', '')
+                params = dict(parse_qsl(query_string))
+
+                if verify_telegram_authorization(params):
+                    user_id = params.get('id')
+                    
+                    if not user_id:
+                        start_response('400 Bad Request', [('Content-Type', 'text/html')])
+                        return [b"<h1>Ошибка: Telegram ID не предоставлен.</h1>"]
+
+                    # Создаем HTML-ответ с JS для установки localStorage и редиректа
+                    success_html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>Авторизация успешна</title>
+                        </head>
+                        <body>
+                            <p>Авторизация Telegram успешна. Идет перенаправление...</p>
+                            <script>
+                                // Устанавливаем ID пользователя, который будет использоваться фронтендом
+                                localStorage.setItem('telegram_user_id', '{user_id}'); 
+                                // Перенаправляем пользователя обратно в магазин, очищая URL от параметров Telegram
+                                window.location.replace('{SITE_BASE_URL}'); 
+                            </script>
+                        </body>
+                        </html>
+                    """
+                    start_response('200 OK', [('Content-Type', 'text/html')])
+                    return [success_html.encode('utf-8')]
+                else:
+                    error_html = f"""
+                        <!DOCTYPE html>
+                        <html>
+                        <head>
+                            <title>Ошибка авторизации</title>
+                        </head>
+                        <body>
+                            <h1>Ошибка авторизации</h1>
+                            <p>Не удалось подтвердить подлинность данных Telegram. Пожалуйста, попробуйте еще раз.</p>
+                            <a href="{SITE_BASE_URL}">Вернуться в магазин</a>
+                        </body>
+                        </html>
+                    """
+                    start_response('401 Unauthorized', [('Content-Type', 'text/html')])
+                    return [error_html.encode('utf-8')]
+            
+            # 2. DEFAULT GET RESPONSE
             start_response('200 OK', [('Content-type', 'text/plain')])
             return [b"OopsServer Running"]
-
+        # ...
     except Exception as e:
         print(f"CRITICAL: {e}")
         start_response('500 Error', [])
