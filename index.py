@@ -4,9 +4,9 @@ import uuid
 import psycopg2 
 import requests 
 import re 
-import hmac # <-- НОВЫЙ ИМПОРТ
-import hashlib # <-- НОВЫЙ ИМПОРТ
-from urllib.parse import parse_qsl # <-- НОВЫЙ ИМПОРТ
+import hmac
+import hashlib 
+from urllib.parse import parse_qsl 
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
@@ -26,7 +26,7 @@ ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
-    ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), # Добавлен GET
+    ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), 
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
@@ -64,8 +64,6 @@ def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
     return is_valid
 
 # --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
-# ... (оставьте остальные функции базы данных без изменений)
-
 def create_psql_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL не установлена.")
@@ -154,12 +152,10 @@ def send_tg_request(method, payload):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        # Логируем ошибку, чтобы видеть причину (например 400 Bad Request)
         print(f"Telegram API Error ({method}): {e}")
         return None
 
 def send_message(chat_id, text, reply_markup=None):
-    # Убрали parse_mode='Markdown' для безопасности
     payload = {'chat_id': chat_id, 'text': text}
     if reply_markup:
         payload['reply_markup'] = reply_markup
@@ -243,7 +239,6 @@ def handle_check_submission(conn, update):
             
             full_order_data = get_order_by_token(conn, order_token)
             
-            # Чтение корзины с защитой
             try:
                 raw_cart = json.loads(full_order_data[2])
                 cart = []
@@ -271,7 +266,6 @@ def handle_check_submission(conn, update):
                 total_amount = 0
                 items_text = "Ошибка чтения товаров."
 
-            # УБРАЛИ MARKDOWN, чтобы избежать ошибки 400
             admin_message = (
                 f"🔔 НОВЫЙ ЗАКАЗ\n"
                 f"Токен: {order_token}\n"
@@ -291,7 +285,6 @@ def handle_check_submission(conn, update):
                 'chat_id': ADMIN_CHAT_ID,
                 'caption': admin_message,
                 'reply_markup': keyboard
-                # parse_mode УДАЛЕН
             }
             
             if file_type == 'photo':
@@ -326,7 +319,6 @@ def handle_callback_query(conn, update):
         new_status = 'completed' if action == 'CONFIRM' else 'cancelled'
         
         if update_order_status_and_user(conn, order_token, new_status):
-            # Обновляем текст сообщения админа без Markdown
             new_caption = message.get('caption', '') + f"\n\n--- Статус ---\n"
             if action == 'CONFIRM':
                 new_caption += f"✅ ОПЛАЧЕНО. Подтвердил: {admin_id}"
@@ -378,14 +370,10 @@ def application(environ, start_response):
             if path == '/':
                 cart_data = data.get('items', data)
                 
-                # --- НОВАЯ ЛОГИКА ДЛЯ ПОЛНОЙ ФОРМЫ (с user_tg_id) ---
                 user_tg_id = data.get('telegram_user_id') 
                 
                 order_token = str(uuid.uuid4()).replace('-', '')[:16] 
-                # !!! ВНИМАНИЕ: Здесь должна быть более сложная логика сохранения всех данных формы (ФИО, Адрес и т.д.)
-                # Я сохраняю только ID Telegram, как было в вашем старом коде
                 
-                # Обновление: Сохраняем все данные, если они пришли
                 full_order_data = {
                     'items': cart_data,
                     'full_name': data.get('full_name'),
@@ -395,20 +383,14 @@ def application(environ, start_response):
                     'comment': data.get('comment')
                 }
                 
-                # Ищем order_token в списке, чтобы обновить, но по логике сайта - это всегда новый заказ.
-                # Поэтому просто сохраняем новый заказ с ID пользователя.
-                
                 cursor = conn.cursor()
                 query = f"""
                 INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data, user_tg_id, phone_number)
                 VALUES (%s, %s, %s, %s, %s)
                 """
-                # Сохраняем телефон и tg_id сразу, если они есть
                 cursor.execute(query, (order_token, "pending_payment_check", json.dumps(full_order_data), user_tg_id, full_order_data.get('phone')))
                 cursor.close()
                 
-                # Отправка администратору о новом заказе (можно добавить сюда!)
-
                 resp = json.dumps({'success': True, 'message': 'Order processed'}).encode('utf-8')
                 start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
                 return [resp]
@@ -429,7 +411,7 @@ def application(environ, start_response):
                 start_response('200 OK', [('Content-type', 'text/plain')])
                 return [b'OK']
 
-            start_response('404 Not Found', [])
+            start_response('404 Not Found', [('Content-type', 'text/plain')])
             return [b'Not Found']
 
         elif method == 'GET':
@@ -445,7 +427,8 @@ def application(environ, start_response):
                     
                     if not user_id:
                         start_response('400 Bad Request', [('Content-Type', 'text/html')])
-                        return [b"<h1>Ошибка: Telegram ID не предоставлен.</h1>"]
+                        # ИСПРАВЛЕНО: Явное кодирование русской строки
+                        return ["<h1>Ошибка: Telegram ID не предоставлен.</h1>".encode('utf-8')]
 
                     # Создаем HTML-ответ с JS для установки localStorage и редиректа
                     success_html = f"""
@@ -487,10 +470,10 @@ def application(environ, start_response):
             # 2. DEFAULT GET RESPONSE
             start_response('200 OK', [('Content-type', 'text/plain')])
             return [b"OopsServer Running"]
-        # ...
+        
     except Exception as e:
         print(f"CRITICAL: {e}")
-        start_response('500 Error', [])
+        start_response('500 Error', [('Content-type', 'application/json')])
         return [json.dumps({'error': str(e)}).encode('utf-8')]
     finally:
         if conn: conn.close()
