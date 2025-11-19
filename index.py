@@ -354,16 +354,24 @@ def application(environ, start_response):
             
             content_length = int(environ.get('CONTENT_LENGTH', '0'))
             request_body = environ['wsgi.input'].read(content_length)
-            data = {}
+            
+            # ИНИЦИАЛИЗИРУЕМ data как словарь
+            data: Dict[str, Any] = {}
             
             try:
-                # ОЧЕНЬ ВАЖНО: Пытаемся декодировать JSON. Если не получается, data остается пустым словарем {}.
-                data = json.loads(request_body.decode('utf-8'))
+                # Пытаемся декодировать JSON.
+                decoded_data = json.loads(request_body.decode('utf-8'))
+                
+                # ФИНАЛЬНАЯ ПРОВЕРКА: Если данные оказались не словарем, игнорируем их.
+                if isinstance(decoded_data, dict):
+                    data = decoded_data
+                else:
+                    print(f"DEBUG: Декодированный запрос не является словарем: {type(decoded_data)}") 
+                    
             except json.JSONDecodeError:
                 print("DEBUG: Не удалось декодировать тело запроса в JSON.")
             except UnicodeDecodeError as e:
                 print(f"DEBUG: Ошибка декодирования Юникода: {e}")
-
 
             # --- A. ОБРАБОТКА ЗАКАЗА С САЙТА (POST /) ---
             if path == '/':
@@ -384,9 +392,8 @@ def application(environ, start_response):
                     start_response('200 OK', response_headers)
                     return [response_data]
 
-            # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (POST /tgwebhook) ---
-            # Обрабатывает запросы, пришедшие на /tgwebhook, или запросы с Telegram на /
-            if path.startswith('/tgwebhook') or ('update_id' in data and 'message' in data): 
+            # --- B. ОБРАБОТКА TELEGRAM WEBHOOK (НОВЫЙ ПУТЬ /newhook) ---
+            if path.startswith('/newhook') and data: 
                 update = data 
                 
                 if 'message' in update:
@@ -404,8 +411,14 @@ def application(environ, start_response):
                 
                 start_response('200 OK', [('Content-type', 'text/plain')])
                 return [b'OK']
+            
+            # --- C. ЛОГИКА ДЛЯ /tgwebhook (ОТМЕНА) ---
+            # Отвечаем 200 OK на старый путь /tgwebhook, чтобы Telegram успокоился.
+            if path.startswith('/tgwebhook'):
+                start_response('200 OK', [('Content-type', 'text/plain')])
+                return [b'OK']
 
-            # Если это POST-запрос на / или /tgwebhook, который не был обработан выше
+            # Если это POST-запрос, который не был обработан выше
             else:
                 start_response('404 Not Found', [('Content-type', 'text/plain')])
                 return [b'Not Found']
