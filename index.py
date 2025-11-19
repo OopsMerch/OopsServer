@@ -111,11 +111,13 @@ def send_tg_request(method, payload):
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
+        # Логируем ошибку, чтобы видеть причину (например 400 Bad Request)
         print(f"Telegram API Error ({method}): {e}")
         return None
 
 def send_message(chat_id, text, reply_markup=None):
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    # Убрали parse_mode='Markdown' для безопасности
+    payload = {'chat_id': chat_id, 'text': text}
     if reply_markup:
         payload['reply_markup'] = reply_markup
     return send_tg_request('sendMessage', payload)
@@ -167,7 +169,7 @@ def handle_contact_share(conn, update):
     if order_data:
         order_token = order_data[0]
         update_order_status_and_user(conn, order_token, 'pending_payment_check', phone_number=phone_number)
-        send_message(chat_id, f"✅ Номер **{phone_number}** подтвержден. Теперь пришлите фотографию (чек) об оплате.")
+        send_message(chat_id, f"✅ Номер {phone_number} подтвержден. Теперь пришлите фотографию (чек) об оплате.")
     else:
         send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения.")
 
@@ -177,7 +179,6 @@ def handle_check_submission(conn, update):
         chat_id = message['chat']['id']
         user_tg_id = message['from']['id']
         
-        # 1. Проверяем заказ
         order_data = get_order_by_tg_id(conn, user_tg_id)
         if not order_data:
             send_message(chat_id, "⚠️ У вас нет активного заказа.")
@@ -185,7 +186,6 @@ def handle_check_submission(conn, update):
 
         order_token = order_data[0]
         
-        # 2. Ищем файл
         file_id = None
         file_type = None
         if 'photo' in message and message['photo']:
@@ -196,56 +196,45 @@ def handle_check_submission(conn, update):
             file_type = 'document'
         
         if file_id:
-            # Обновляем статус
             update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
             
-            # Загружаем данные для админа
             full_order_data = get_order_by_token(conn, order_token)
             
-            # === ЗАЩИТА ОТ БИТЫХ ДАННЫХ КОРЗИНЫ (ИСПРАВЛЕНИЕ ОШИБКИ 'str' object has no attribute 'get') ===
+            # Чтение корзины с защитой
             try:
-                # Пытаемся найти список товаров. Он может быть в 'items' или прямо в корне, или в 'cart_data'
                 raw_cart = json.loads(full_order_data[2])
                 cart = []
-                
-                # Нормализация данных корзины
                 if isinstance(raw_cart, list):
                     cart = raw_cart
                 elif isinstance(raw_cart, dict):
-                    if 'items' in raw_cart and isinstance(raw_cart['items'], list):
-                        cart = raw_cart['items']
-                    else:
-                        cart = [raw_cart] # Если это один словарь
+                    if 'items' in raw_cart: cart = raw_cart['items']
+                    else: cart = [raw_cart]
                 
                 total_amount = 0
                 items_text = ""
                 
                 for item in cart:
-                    # КРИТИЧЕСКАЯ ПРОВЕРКА: Является ли item словарем?
                     if isinstance(item, dict):
-                        name = item.get('name', 'Товар без названия')
+                        name = item.get('name', 'Товар')
                         size = item.get('size', '-')
                         qty = item.get('quantity', 1)
                         price = item.get('price', 0)
-                        
                         total_amount += price * qty
                         items_text += f"— {name} ({size}) x{qty}\n"
                     else:
-                        # Если item это строка (что вызывало ошибку), просто пишем её
-                        items_text += f"— Некорректные данные товара: {str(item)}\n"
+                        items_text += f"— {str(item)}\n"
 
-            except Exception as parse_e:
-                print(f"Ошибка парсинга корзины: {parse_e}")
+            except Exception:
                 total_amount = 0
-                items_text = "Ошибка чтения состава заказа."
+                items_text = "Ошибка чтения товаров."
 
-            # Формируем сообщение
+            # УБРАЛИ MARKDOWN, чтобы избежать ошибки 400
             admin_message = (
-                f"🔔 *НОВЫЙ ЗАКАЗ*\n"
-                f"Токен: `{order_token}`\n"
-                f"Телефон: `{full_order_data[3] or 'Нет данных'}`\n"
-                f"Сумма: **{total_amount}** руб.\n\n"
-                f"*Состав заказа:*\n{items_text}"
+                f"🔔 НОВЫЙ ЗАКАЗ\n"
+                f"Токен: {order_token}\n"
+                f"Телефон: {full_order_data[3] or 'Нет данных'}\n"
+                f"Сумма: {total_amount} руб.\n\n"
+                f"Состав заказа:\n{items_text}"
             )
             
             keyboard = {
@@ -255,12 +244,11 @@ def handle_check_submission(conn, update):
                 ]
             }
             
-            # Отправка админу
             req_payload = {
                 'chat_id': ADMIN_CHAT_ID,
                 'caption': admin_message,
-                'parse_mode': 'Markdown',
                 'reply_markup': keyboard
+                # parse_mode УДАЛЕН
             }
             
             if file_type == 'photo':
@@ -276,49 +264,48 @@ def handle_check_submission(conn, update):
             send_message(chat_id, "⚠️ Пожалуйста, пришлите фотографию или документ (чек).")
 
     except Exception as e:
-        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА В handle_check_submission: {e}")
-        try:
-             send_message(chat_id, f"❌ Ошибка сервера: {e}")
-        except:
-             pass
+        print(f"!!! КРИТИЧЕСКАЯ ОШИБКА: {e}")
+        try: send_message(chat_id, f"❌ Ошибка сервера: {e}")
+        except: pass
 
 def handle_callback_query(conn, update):
-    callback_query = update['callback_query']
-    data = callback_query['data']
-    admin_id = callback_query['from']['id']
-    message = callback_query['message']
-    
-    match = re.search(r'(CONFIRM|REJECT)_(\w+)', data)
-    if not match:
-        send_tg_request('answerCallbackQuery', {'callback_query_id': callback_query['id'], 'text': 'Неизвестная команда.'})
-        return
+    try:
+        callback_query = update['callback_query']
+        data = callback_query['data']
+        admin_id = callback_query['from']['id']
+        message = callback_query['message']
         
-    action = match.group(1)
-    order_token = match.group(2)
-    new_status = 'completed' if action == 'CONFIRM' else 'cancelled'
-    
-    if update_order_status_and_user(conn, order_token, new_status):
-        new_caption = message.get('caption', '') + f"\n\n--- Статус ---\n"
-        if action == 'CONFIRM':
-            new_caption += f"✅ ОПЛАЧЕНО. Подтвердил: {admin_id}"
-            user_msg = f"✅ Оплата подтверждена! Ваш заказ **{order_token}** оформлен."
-        else:
-            new_caption += f"❌ ОТКЛОНЕНО. Отклонил: {admin_id}"
-            user_msg = f"❌ Оплата отклонена. Свяжитесь с администратором."
-        
-        send_tg_request('editMessageCaption', {
-            'chat_id': message['chat']['id'],
-            'message_id': message['message_id'],
-            'caption': new_caption,
-            'parse_mode': 'Markdown',
-            'reply_markup': {"inline_keyboard": []}
-        })
-        
-        order_data = get_order_by_token(conn, order_token)
-        if order_data and order_data[4]: 
-            send_message(order_data[4], user_msg)
+        match = re.search(r'(CONFIRM|REJECT)_(\w+)', data)
+        if not match: return
             
-        send_tg_request('answerCallbackQuery', {'callback_query_id': callback_query['id'], 'text': 'Статус обновлен.'})
+        action = match.group(1)
+        order_token = match.group(2)
+        new_status = 'completed' if action == 'CONFIRM' else 'cancelled'
+        
+        if update_order_status_and_user(conn, order_token, new_status):
+            # Обновляем текст сообщения админа без Markdown
+            new_caption = message.get('caption', '') + f"\n\n--- Статус ---\n"
+            if action == 'CONFIRM':
+                new_caption += f"✅ ОПЛАЧЕНО. Подтвердил: {admin_id}"
+                user_msg = f"✅ Оплата подтверждена! Ваш заказ оформлен."
+            else:
+                new_caption += f"❌ ОТКЛОНЕНО. Отклонил: {admin_id}"
+                user_msg = f"❌ Оплата отклонена. Свяжитесь с администратором."
+            
+            send_tg_request('editMessageCaption', {
+                'chat_id': message['chat']['id'],
+                'message_id': message['message_id'],
+                'caption': new_caption,
+                'reply_markup': {"inline_keyboard": []}
+            })
+            
+            order_data = get_order_by_token(conn, order_token)
+            if order_data and order_data[4]: 
+                send_message(order_data[4], user_msg)
+                
+            send_tg_request('answerCallbackQuery', {'callback_query_id': callback_query['id'], 'text': 'Статус обновлен.'})
+    except Exception as e:
+        print(f"Ошибка callback: {e}")
 
 
 # --- ГЛАВНЫЙ WSGI ОБРАБОТЧИК ---
@@ -346,8 +333,7 @@ def application(environ, start_response):
 
             # A. ЗАКАЗ С САЙТА
             if path == '/':
-                # Сохраняем заказ, даже если структура не идеальна, чтобы получить токен
-                cart_data = data.get('items', data) # Пытаемся найти items или берем всё
+                cart_data = data.get('items', data)
                 order_token = str(uuid.uuid4()).replace('-', '')[:16] 
                 save_order_to_db(conn, order_token, cart_data)
                 
