@@ -178,6 +178,7 @@ def handle_start(conn, update):
     user_tg_id = message['from']['id']
     text = message['text']
     
+    # Ищем токен (с префиксом или без)
     match = re.search(r'/start\s+(\w+)', text)
     order_token_full = match.group(1) if match else None
     
@@ -185,14 +186,20 @@ def handle_start(conn, update):
          send_message(chat_id, "Use the link from the website to start the ordering process.")
          return
 
+    # Логика обработки токенов с префиксом
     if order_token_full.startswith('pay_'):
         order_token = order_token_full.replace('pay_', '')
         handle_pay_start(conn, chat_id, user_tg_id, order_token) 
+    elif order_token_full.startswith('auth_'):
+        order_token = order_token_full.replace('auth_', '')
+        handle_auth_start(conn, chat_id, user_tg_id, order_token)
     else:
+        # Для обратной совместимости или если токен пришел без префикса (первый шаг)
         handle_auth_start(conn, chat_id, user_tg_id, order_token_full)
 
 def handle_auth_start(conn, chat_id, user_tg_id, order_token):
     try:
+        # В этом месте order_token должен быть ЧИСТЫМ токеном (без auth_)
         updated = update_order_status_and_user(conn, order_token, 'pending_phone_auth', user_tg_id=user_tg_id)
         if updated:
             keyboard = {
@@ -215,7 +222,8 @@ def handle_pay_start(conn, chat_id, user_tg_id, order_token):
     order_data = get_order_by_token(conn, order_token)
     
     if order_data and order_data[4] == user_tg_id: 
-        update_order_status_and_user(conn, order_token, 'pending_check_submission', user_tg_id=user_tg_id)
+        # Обновляем статус, но не меняем user_tg_id, так как он уже есть
+        update_order_status_and_user(conn, order_token, 'pending_check_submission') 
         
         send_message(
             chat_id, 
@@ -237,7 +245,8 @@ def handle_contact_share(conn, update):
         order_token = order_data[0]
         update_order_status_and_user(conn, order_token, 'pending_delivery_data', phone_number=phone_number)
         
-        redirect_url = f"{SITE_BASE_URL}/checkout?token={order_token}&tg_id={user_tg_id}"
+        # URL для возврата на сайт
+        redirect_url = f"{SITE_BASE_URL}/?token={order_token}&tg_id={user_tg_id}"
         
         keyboard = {
             "inline_keyboard": [
@@ -424,7 +433,8 @@ def application(environ, start_response):
                 
                 save_order_draft(conn, order_token, cart_data)
                 
-                tg_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}"
+                # ИСПРАВЛЕНИЕ: Добавлен префикс 'auth_' для четкого разделения команд
+                tg_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=auth_{order_token}"
                 
                 resp = json.dumps({'success': True, 'telegram_auth_url': tg_link}).encode('utf-8')
                 start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
@@ -434,6 +444,7 @@ def application(environ, start_response):
             if path == '/submit-full-order':
                 if update_order_full_details(conn, data):
                     order_token = data.get('order_token')
+                    # Префикс 'pay_' для второго шага
                     tg_check_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=pay_{order_token}"
 
                     resp = json.dumps({
