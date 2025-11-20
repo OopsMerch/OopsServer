@@ -131,10 +131,11 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         cursor.execute(query, params)
         return cursor.rowcount > 0
 
+# ИСПРАВЛЕНИЕ: Добавлен 'user_tg_id' в SELECT запрос
 def get_order_by_tg_id(conn, user_tg_id):
     query = f"""
     SELECT 
-        order_token, status, total_amount, cart_data, phone_number, full_name, address, delivery_type, delivery_address_data
+        order_token, status, total_amount, cart_data, phone_number, full_name, address, delivery_type, delivery_address_data, user_tg_id
     FROM 
         {ORDERS_TABLE_NAME}
     WHERE 
@@ -183,12 +184,10 @@ def send_message(chat_id, text, reply_markup=None):
             payload['reply_markup'] = reply_markup
             
     try:
-        # requests.post(url, json=payload, timeout=5) # Добавлено timeout для стабильности
         requests.post(url, json=payload)
     except Exception as e:
         print(f"Error sending message to {chat_id}: {e}")
 
-# ИСПРАВЛЕНИЕ ДЛЯ ПУНКТА 2 (ОБРАБОТКА ЧЕКА)
 def generate_admin_order_message(order_data):
     # ИСПРАВЛЕНИЕ #2: Проверка, нужно ли декодировать cart_data
     cart_data_raw = order_data['cart_data']
@@ -312,9 +311,10 @@ def handle_telegram_update(conn, update):
             
             # ! Проверка: Убедитесь, что это администратор, если ID группы совпадает !
             
-            if order_data and order_data['status'] == STATUS_AWAITING_ADMIN: # Изменено на AWAITING_ADMIN
+            # Мы проверяем статус AWAITING_ADMIN, так как кнопка должна быть нажата после оплаты
+            if order_data and order_data['status'] == STATUS_AWAITING_ADMIN: 
                  # Меняем статус и запрашиваем ввод данных от админа
-                 update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
+                 # Не меняем статус, так как он уже AWAITING_ADMIN, просто отправляем запрос
                  
                  response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
                  
@@ -536,11 +536,7 @@ def handle_telegram_update(conn, update):
         
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
-        # Проверяем, если сообщение пришло от администратора в группу и мы ожидаем ввод
-        # Используем order, который был найден по chat_id (admin group ID)
-        if str(chat_id) == TG_ADMIN_GROUP_ID or (TG_ADMIN_GROUP_ID and str(chat_id) == TG_ADMIN_GROUP_ID):
-            
-            # Мы ищем заказ, который находится в статусе AWAITING_ADMIN, чтобы его обработать
+        if str(chat_id) == TG_ADMIN_GROUP_ID:
             
             try:
                 # Ожидаемый формат: ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА
@@ -550,19 +546,10 @@ def handle_telegram_update(conn, update):
                      
                 track_number, pvz_address, delivery_date_str = parts
 
-                # Находим заказ, который ожидает ввода, ищем по токену, если админ указал его
-                # Здесь нам нужен способ связать ввод админа с конкретным заказом.
-                # В текущей упрощенной логике мы не можем этого сделать без дополнительного шага.
-                # Мы будем искать самый последний заказ в статусе AWAITING_ADMIN (если чат_ид = TG_ADMIN_GROUP_ID).
-                
+                # Ищем самый последний заказ в статусе AWAITING_ADMIN
                 order_to_update = None
-                # Поскольку ввод админа не содержит токена, это сложный момент. 
-                # Проще всего требовать, чтобы админ вводил токен. 
-                # Но по логике, мы должны найти order_token из сообщения, на которое отвечал админ.
-                
-                # Временно, для упрощения, мы ищем заказ, который находится в AWAITING_ADMIN:
-                
                 with conn.cursor() as cur:
+                     # Добавляем user_tg_id и full_name для отправки уведомления клиенту
                      cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
                      row = cur.fetchone()
                      if row:
@@ -595,6 +582,7 @@ def handle_telegram_update(conn, update):
 ---
 🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
 """
+                    # Теперь order_to_update['user_tg_id'] гарантированно есть
                     send_message(int(order_to_update['user_tg_id']), client_message)
                     
                     send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_to_update['order_token']})")
