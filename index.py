@@ -279,18 +279,26 @@ def send_payment_details(chat_id, order_data):
     remove_keyboard = {"remove_keyboard": True}
     send_message(chat_id, message, reply_markup=remove_keyboard)
     
+def generate_order_summary_list(order_data):
+    cart_items = json.loads(order_data.get('cart_data', '[]'))
+    items_list = "\n".join([
+        f"{item['quantity']} шт. | {item['name']} (Размер: {item['size']})" 
+        for item in cart_items
+    ])
+    return items_list
+
 # --- TELEGRAM BOT LOGIC (Handle Updates) ---
 
 def handle_telegram_update(conn, update):
     
-    # 1. ОБРАБОТКА CALLBACK_QUERY (Кнопки в чате админа)
+    # 1. ОБРАБОТКА CALLBACK_QUERY (Кнопки в чате админа И пользователя)
     if 'callback_query' in update:
         query = update['callback_query']
         chat_id = query['message']['chat']['id']
         message_id = query['message']['message_id']
         data = query['data']
 
-        # Простая заглушка для админской кнопки
+        # --- АДМИНСКАЯ ЛОГИКА ---
         if data.startswith('admin_process_'):
             order_token = data.replace('admin_process_', '')
             order_data = get_order_by_token(conn, order_token)
@@ -316,6 +324,108 @@ def handle_telegram_update(conn, update):
                  # Отправляем отдельное сообщение с запросом ввода
                  send_message(chat_id, response_text, reply_markup=None)
             
+            return # Выходим после обработки админской кнопки
+        
+        # --- ПОЛЬЗОВАТЕЛЬСКАЯ ЛОГИКА (Если это не админская кнопка) ---
+        
+        # Получаем контекст заказа
+        order = get_order_by_tg_id(conn, str(chat_id))
+        
+        if order and order['status'] in [STATUS_PENDING_DELIVERY_TYPE, STATUS_PENDING_CONFIRMATION]:
+            order_token = order['order_token']
+            
+            # --- Выбор способа доставки ---
+            delivery_type = None
+            delivery_info = ""
+            
+            if data == 'delivery_sdek' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
+                delivery_type = 'СДЭК'
+                delivery_info = f"Для **СДЭК** будет выбран ближайший пункт выдачи (ПВЗ) к указанному вами адресу: *{order['address']}*."
+            elif data == 'delivery_russian_post' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
+                delivery_type = 'Почта России'
+                delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
+            
+            # Переход к подтверждению
+            if delivery_type:
+                # Обновляем заказ, переходим к подтверждению
+                update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
+                
+                confirmation_message = f"""
+✅ Способ получения: **{delivery_type}** выбран! 
+{delivery_info}
+
+---
+**Проверьте ваши данные:**
+👤 **ФИО:** {order['full_name']}
+📱 **Телефон:** {order['phone_number']}
+📍 **Адрес:** {order['address']}
+🚚 **Способ:** {delivery_type}
+
+---
+**Подтвердите оформление заказа?**
+"""
+                keyboard = {
+                    "inline_keyboard": [
+                        [{"text": "✅ Подтвердить", "callback_data": "confirm_order"}],
+                        [{"text": "❌ Заполнить заново", "callback_data": "start_over"}]
+                    ]
+                }
+                
+                # Редактируем сообщение, чтобы избежать спама
+                edit_message_url = TG_API_BASE + 'editMessageText'
+                requests.post(edit_message_url, json={
+                    'chat_id': chat_id,
+                    'message_id': query['message']['message_id'],
+                    'text': confirmation_message,
+                    'parse_mode': 'Markdown',
+                    'reply_markup': json.dumps(keyboard)
+                })
+                
+                return # Выходим после обработки выбора доставки
+            
+            # --- Подтверждение/Сброс ---
+            elif data == 'confirm_order' and order['status'] == STATUS_PENDING_CONFIRMATION:
+                # Обновляем статус на ожидание оплаты
+                update_order(conn, order_token=order_token, status=STATUS_PENDING_PAYMENT)
+                
+                # Отправляем реквизиты
+                send_payment_details(chat_id, order)
+                
+                # Редактируем сообщение для фиксации выбора
+                edit_message_url = TG_API_BASE + 'editMessageText'
+                requests.post(edit_message_url, json={
+                    'chat_id': chat_id,
+                    'message_id': query['message']['message_id'],
+                    'text': query['message']['text'] + '\n\n**Статус:** ✅ **Подтверждено.** Ожидаем оплаты.',
+                    'parse_mode': 'Markdown',
+                    'reply_markup': json.dumps({"inline_keyboard": []}) # Убираем кнопку
+                })
+                return # Выходим после подтверждения
+            
+            elif data == 'start_over':
+                # Сбрасываем заказ в начальный статус (ожидание ФИО)
+                update_order(
+                    conn, 
+                    order_token=order_token, 
+                    full_name=None, 
+                    address=None, 
+                    delivery_type=None,
+                    status=STATUS_PENDING_FULL_NAME
+                )
+                
+                send_message(chat_id, "🔄 **Начинаем заново.** Введите ваше **ФИО** (Полностью):")
+                # Редактируем сообщение для фиксации сброса
+                edit_message_url = TG_API_BASE + 'editMessageText'
+                requests.post(edit_message_url, json={
+                    'chat_id': chat_id,
+                    'message_id': query['message']['message_id'],
+                    'text': query['message']['text'] + '\n\n**Статус:** ❌ **Сброшено.**',
+                    'parse_mode': 'Markdown',
+                    'reply_markup': json.dumps({"inline_keyboard": []})
+                })
+                return # Выходим после сброса
+
+        # Если это callback_query, но не для текущего активного заказа, просто выходим, чтобы не обрабатывать как текст
         return
         
     if 'message' not in update: return
@@ -393,28 +503,25 @@ def handle_telegram_update(conn, update):
             return
             
         # --- 3.3 ОЖИДАНИЕ ВЫБОРА ДОСТАВКИ (КНОПКА) ---
-        # Эта логика обрабатывается через callback_query, но в рамках упрощения,
-        # если пользователь пришлет текст, просто повторим вопрос с кнопками.
+        # Эта секция теперь обрабатывает только текстовый ввод, если пользователь не нажал кнопку.
         elif current_status == STATUS_PENDING_DELIVERY_TYPE:
-             # Проверяем, если это не нажатие inline-кнопки
-             if 'callback_query' not in update:
-                # Пытаемся обработать выбор из текста (для простоты)
-                delivery_type_text = text.lower()
-                delivery_type = None
-                delivery_info = ""
-                
-                if 'сдэк' in delivery_type_text:
-                    delivery_type = 'СДЭК'
-                    delivery_info = f"Для **СДЭК** будет выбран ближайший пункт выдачи (ПВЗ) к указанному вами адресу: *{order['address']}*."
-                elif 'почта' in delivery_type_text:
-                    delivery_type = 'Почта России'
-                    delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
-                
-                if delivery_type:
-                    # Обновляем заказ, переходим к подтверждению
-                    update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
-                    
-                    confirmation_message = f"""
+             # Пытаемся обработать выбор из текста (для простоты)
+             delivery_type_text = text.lower()
+             delivery_type = None
+             delivery_info = ""
+             
+             if 'сдэк' in delivery_type_text:
+                 delivery_type = 'СДЭК'
+                 delivery_info = f"Для **СДЭК** будет выбран ближайший пункт выдачи (ПВЗ) к указанному вами адресу: *{order['address']}*."
+             elif 'почта' in delivery_type_text:
+                 delivery_type = 'Почта России'
+                 delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
+             
+             if delivery_type:
+                 # Обновляем заказ, переходим к подтверждению
+                 update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
+                 
+                 confirmation_message = f"""
 ✅ Способ получения: **{delivery_type}** выбран! 
 {delivery_info}
 
@@ -428,29 +535,28 @@ def handle_telegram_update(conn, update):
 ---
 **Подтвердите оформление заказа?**
 """
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": "✅ Подтвердить", "callback_data": "confirm_order"}],
-                            [{"text": "❌ Заполнить заново", "callback_data": "start_over"}]
-                        ]
-                    }
-                    send_message(chat_id, confirmation_message, reply_markup=keyboard)
-                    return
-                else:
-                    # Повторяем запрос
-                    keyboard = {
-                        "inline_keyboard": [
-                            [{"text": "🚚 СДЭК", "callback_data": "delivery_sdek"}],
-                            [{"text": "📬 Почта России", "callback_data": "delivery_russian_post"}]
-                        ]
-                    }
-                    send_message(chat_id, "⚠️ Не удалось распознать способ. Выберите **СДЭК** или **Почта России**.", reply_markup=keyboard)
-                    return
+                 keyboard = {
+                     "inline_keyboard": [
+                         [{"text": "✅ Подтвердить", "callback_data": "confirm_order"}],
+                         [{"text": "❌ Заполнить заново", "callback_data": "start_over"}]
+                     ]
+                 }
+                 send_message(chat_id, confirmation_message, reply_markup=keyboard)
+                 return
+             else:
+                 # Повторяем запрос
+                 keyboard = {
+                     "inline_keyboard": [
+                         [{"text": "🚚 СДЭК", "callback_data": "delivery_sdek"}],
+                         [{"text": "📬 Почта России", "callback_data": "delivery_russian_post"}]
+                     ]
+                 }
+                 send_message(chat_id, "⚠️ Не удалось распознать способ. Выберите **СДЭК** или **Почта России**.", reply_markup=keyboard)
+                 return
 
         # --- 3.4 ОЖИДАНИЕ ФАЙЛА (ЧЕКА) ---
         elif current_status == STATUS_PENDING_PAYMENT:
             # Если прислали фотографию, документ или просто текст - считаем, что это подтверждение оплаты.
-            # В реальной системе тут нужно более строго проверять тип файла (document, photo)
             if 'photo' in message or 'document' in message or text:
                  # Меняем статус на ожидание админа
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
@@ -464,22 +570,14 @@ def handle_telegram_update(conn, update):
                  return
                  
         # --- 3.5 ОБРАБОТКА ОТВЕТА АДМИНИСТРАТОРА В ГРУППЕ ---
-        # Логика для админской группы (должна быть отдельной)
+        
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
         # Проверяем, если сообщение пришло от администратора в группу и мы ожидаем ввод
-        if str(chat_id) == TG_ADMIN_GROUP_ID or (TG_ADMIN_GROUP_ID and chat_id == int(TG_ADMIN_GROUP_ID)):
-            # Ищем любой заказ в статусе STATUS_AWAITING_ADMIN
-            # В идеале нужно привязать ответ к конкретному заказу (например, через Reply)
-            # Но для упрощения возьмем последний заказ в этом статусе.
+        if str(chat_id) == TG_ADMIN_GROUP_ID or (TG_ADMIN_GROUP_ID and str(chat_id) == TG_ADMIN_GROUP_ID):
+            # В этом упрощенном примере мы просто обрабатываем ввод, предполагая, что это ответ на последний запрос
             
-            # ! Для масштабирования: Здесь нужна более сложная логика привязки ответа к заказу, 
-            # ! например, через проверку, что это ответ на сообщение бота с кнопкой "Оформить"
-            
-            if order and order['status'] == STATUS_AWAITING_ADMIN: # Логика не совсем верна, но для демо - подойдет
-                
-                # Ищем заказ, который ожидает ввода данных администратора
-                # В этом упрощенном примере мы просто обрабатываем ввод, предполагая, что это ответ на последний запрос
+            if order and order['status'] == STATUS_AWAITING_ADMIN: 
                 
                 try:
                     # Ожидаемый формат: ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА
@@ -533,115 +631,6 @@ def handle_telegram_update(conn, update):
                     send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
                     return
 
-
-    # 4. ОБРАБОТКА CALLBACK_QUERY (Кнопки в чате пользователя - Выбор доставки/Подтверждение)
-    if 'callback_query' in update:
-        query = update['callback_query']
-        chat_id = query['message']['chat']['id']
-        data = query['data']
-        
-        # Получаем контекст заказа
-        order = get_order_by_tg_id(conn, str(chat_id))
-        
-        if order and order['status'] in [STATUS_PENDING_DELIVERY_TYPE, STATUS_PENDING_CONFIRMATION]:
-            order_token = order['order_token']
-            
-            # --- Выбор способа доставки ---
-            if data == 'delivery_sdek' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
-                delivery_type = 'СДЭК'
-                delivery_info = f"Для **СДЭК** будет выбран ближайший пункт выдачи (ПВЗ) к указанному вами адресу: *{order['address']}*."
-            elif data == 'delivery_russian_post' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
-                delivery_type = 'Почта России'
-                delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
-            
-            # Переход к подтверждению
-            if 'delivery_type' in locals():
-                # Обновляем заказ, переходим к подтверждению
-                update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
-                
-                confirmation_message = f"""
-✅ Способ получения: **{delivery_type}** выбран! 
-{delivery_info}
-
----
-**Проверьте ваши данные:**
-👤 **ФИО:** {order['full_name']}
-📱 **Телефон:** {order['phone_number']}
-📍 **Адрес:** {order['address']}
-🚚 **Способ:** {delivery_type}
-
----
-**Подтвердите оформление заказа?**
-"""
-                keyboard = {
-                    "inline_keyboard": [
-                        [{"text": "✅ Подтвердить", "callback_data": "confirm_order"}],
-                        [{"text": "❌ Заполнить заново", "callback_data": "start_over"}]
-                    ]
-                }
-                
-                # Редактируем сообщение, чтобы избежать спама
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={
-                    'chat_id': chat_id,
-                    'message_id': query['message']['message_id'],
-                    'text': confirmation_message,
-                    'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps(keyboard)
-                })
-                
-                return
-            
-            # --- Подтверждение/Сброс ---
-            elif data == 'confirm_order' and order['status'] == STATUS_PENDING_CONFIRMATION:
-                # Обновляем статус на ожидание оплаты
-                update_order(conn, order_token=order_token, status=STATUS_PENDING_PAYMENT)
-                
-                # Отправляем реквизиты
-                send_payment_details(chat_id, order)
-                
-                # Редактируем сообщение для фиксации выбора
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={
-                    'chat_id': chat_id,
-                    'message_id': query['message']['message_id'],
-                    'text': query['message']['text'] + '\n\n**Статус:** ✅ **Подтверждено.** Ожидаем оплаты.',
-                    'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps({"inline_keyboard": []}) # Убираем кнопку
-                })
-                return
-            
-            elif data == 'start_over':
-                # Сбрасываем заказ в начальный статус (ожидание ФИО)
-                update_order(
-                    conn, 
-                    order_token=order_token, 
-                    full_name=None, 
-                    address=None, 
-                    delivery_type=None,
-                    status=STATUS_PENDING_FULL_NAME
-                )
-                
-                send_message(chat_id, "🔄 **Начинаем заново.** Введите ваше **ФИО** (Полностью):")
-                # Редактируем сообщение для фиксации сброса
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={
-                    'chat_id': chat_id,
-                    'message_id': query['message']['message_id'],
-                    'text': query['message']['text'] + '\n\n**Статус:** ❌ **Сброшено.**',
-                    'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps({"inline_keyboard": []})
-                })
-                return
-
-    
-def generate_order_summary_list(order_data):
-    cart_items = json.loads(order_data.get('cart_data', '[]'))
-    items_list = "\n".join([
-        f"{item['quantity']} шт. | {item['name']} (Размер: {item['size']})" 
-        for item in cart_items
-    ])
-    return items_list
 
 # --- MAIN APPLICATION (WSGI) ---
 
@@ -699,11 +688,7 @@ def application(environ, start_response):
                 body = environ['wsgi.input'].read(size)
                 update = json.loads(body)
                 
-                # ! ДОБАВЛЕНИЕ ЛОГИКИ ОБРАБОТКИ CALLBACK QUERY !
-                if 'callback_query' in update:
-                    handle_telegram_update(conn, update)
-                elif 'message' in update:
-                    handle_telegram_update(conn, update)
+                handle_telegram_update(conn, update)
                 
                 start_response('200 OK', [('Content-Type', 'text/plain')])
                 return [b'OK']
