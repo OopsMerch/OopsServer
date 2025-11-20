@@ -14,7 +14,10 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
-TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID')
+# .strip().replace... убирает возможные кавычки и пробелы, если они попали в переменную
+raw_admin_id = os.environ.get('TG_ADMIN_GROUP_ID', '')
+TG_ADMIN_GROUP_ID = str(raw_admin_id).strip().replace("'", "").replace('"', "")
+
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
 
 # ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
@@ -99,15 +102,12 @@ def save_order_draft(conn, order_token, cart_data, total_amount):
         """
         cursor.execute(query, (order_token, STATUS_PENDING_AUTH, json.dumps(cart_data), total_amount))
 
-# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ---
-# Переименовали аргумент фильтрации в filter_user_tg_id, чтобы он не конфликтовал с полем user_tg_id в kwargs
 def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
     if not kwargs: return False
     
     updates = ["updated_at = CURRENT_TIMESTAMP"]
     params = []
     
-    # Теперь user_tg_id попадает сюда (в kwargs) и добавляется в запрос UPDATE
     for key, value in kwargs.items():
         if key == 'cart_data':
              updates.append(f"{key} = %s::jsonb")
@@ -120,7 +120,6 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
         where_clause = "order_token = %s"
         params.append(order_token)
     elif filter_user_tg_id:
-        # Ищем только "активные" заказы по user_tg_id
         where_clause = f"user_tg_id = %s AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}')"
         params.append(filter_user_tg_id)
     else:
@@ -408,6 +407,76 @@ def handle_telegram_update(conn, update):
     chat_id = message['chat']['id']
     text = message.get('text', '')
     
+    # --- ПРОВЕРКА АДМИНА (ДО ПОИСКА ЗАКАЗА ПОЛЬЗОВАТЕЛЯ) ---
+    global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
+    
+    # ДЕБАГ: Смотрим, что приходит и с чем сравниваем
+    print(f"DEBUG: Checking Admin match: '{chat_id}' vs '{TG_ADMIN_GROUP_ID}'")
+
+    if str(chat_id) == TG_ADMIN_GROUP_ID:
+        print("DEBUG: Admin group detected. Parsing text...")
+        try:
+            # Ожидаемый формат: ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА
+            parts = [x.strip() for x in text.split('|')]
+            if len(parts) != 3:
+                 # Если админ пишет что-то другое (не по формату), просто игнорируем или логируем
+                 print("DEBUG: Admin text format incorrect (not 3 parts). Ignoring.")
+                 return 
+                 
+            track_number, pvz_address, delivery_date_str = parts
+            print(f"DEBUG: Admin data parsed: {track_number}, {pvz_address}, {delivery_date_str}")
+
+            # Ищем последний активный заказ в ожидании админа
+            order_to_update = None
+            with conn.cursor() as cur:
+                 cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
+                 row = cur.fetchone()
+                 if row:
+                     columns = [desc[0] for desc in cur.description]
+                     order_to_update = dict(zip(columns, row))
+
+            if order_to_update:
+                print(f"DEBUG: Updating order {order_to_update['order_token']}")
+                update_order(
+                    conn, 
+                    order_token=order_to_update['order_token'], 
+                    admin_track_number=track_number, 
+                    delivery_address_data=pvz_address,
+                    admin_delivery_date=delivery_date_str, 
+                    status=STATUS_COMPLETED
+                )
+
+                client_message = f"""
+✅ **Ваш заказ оформлен!**
+
+Вот **трек-номер**: `{track_number}`
+
+Пункт выдачи: 
+*{pvz_address}*
+
+🕰️ Примерная дата получения:
+**{delivery_date_str}**
+
+---
+🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
+"""
+                send_message(int(order_to_update['user_tg_id']), client_message)
+                
+                send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_to_update['order_token']})")
+                return
+
+            else:
+                send_message(chat_id, "⚠️ Не найден активный заказ в статусе 'Ожидает ввода'.")
+                return
+
+        except Exception as e:
+            print(f"Admin input parsing error: {e}")
+            send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
+            return
+    
+    # --- КОНЕЦ ПРОВЕРКИ АДМИНА ---
+    
+    # Если это не админ, ищем заказ пользователя
     order = get_order_by_tg_id(conn, str(chat_id))
     
     # 1. ОБРАБОТКА КОНТАКТА
@@ -416,11 +485,12 @@ def handle_telegram_update(conn, update):
         phone = message['contact']['phone_number']
         
         if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
-            print(f"DEBUG: Order updated with phone {phone}.") 
+            print(f"DEBUG: Order {order['order_token']} updated successfully with phone {phone}. Sending next prompt.") 
             remove_keyboard = {"remove_keyboard": True}
             send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
         else:
-            send_message(chat_id, "⚠️ Ошибка обновления заказа.", reply_markup={"remove_keyboard": True})
+            print(f"DEBUG: Order update FAILED for {order['order_token']} in PENDING_AUTH.") 
+            send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
         
         return
 
@@ -430,10 +500,10 @@ def handle_telegram_update(conn, update):
         if len(params) > 1 and params[1].startswith('auth_'):
             order_token = params[1].replace('auth_', '')
             
-            # ТЕПЕРЬ user_tg_id БУДЕТ ОБНОВЛЕН, Т.К. ОН ПОПАДЕТ В KWARGS
+            # Используем kwargs (именованный аргумент) для обновления user_tg_id
             update_success = update_order(conn, order_token=order_token, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH)
             
-            print(f"DEBUG: START. Token: {order_token}. Success: {update_success}") 
+            print(f"DEBUG: START command received. Token: {order_token}. Update success: {update_success}") 
 
             if update_success:
                 keyboard = {
@@ -505,65 +575,6 @@ def handle_telegram_update(conn, update):
                     
                  send_message(chat_id, "✨ **Отлично!** Мы получили ваше подтверждение оплаты.\n\nПередаем заказ администратору для оформления доставки и трек-номера. Это займет некоторое время.")
                  return
-                 
-        # --- 3.5 ОБРАБОТКА ОТВЕТА АДМИНИСТРАТОРА В ГРУППЕ ---
-        
-        global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
-        
-        if str(chat_id) == TG_ADMIN_GROUP_ID:
-            
-            try:
-                parts = [x.strip() for x in text.split('|')]
-                if len(parts) != 3:
-                     raise ValueError("Incorrect input format.")
-                     
-                track_number, pvz_address, delivery_date_str = parts
-
-                order_to_update = None
-                with conn.cursor() as cur:
-                     cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
-                     row = cur.fetchone()
-                     if row:
-                         columns = [desc[0] for desc in cur.description]
-                         order_to_update = dict(zip(columns, row))
-
-                if order_to_update:
-                    update_order(
-                        conn, 
-                        order_token=order_to_update['order_token'], 
-                        admin_track_number=track_number, 
-                        delivery_address_data=pvz_address,
-                        admin_delivery_date=delivery_date_str, 
-                        status=STATUS_COMPLETED
-                    )
-
-                    client_message = f"""
-✅ **Ваш заказ оформлен!** (Токен: `{order_to_update['order_token']}`)
-
-Вот **трек-номер**: `{track_number}`
-
-Пункт выдачи: 
-*{pvz_address}*
-
-🕰️ Примерная дата получения:
-**{delivery_date_str}**
-
----
-🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
-"""
-                    send_message(int(order_to_update['user_tg_id']), client_message)
-                    
-                    send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_to_update['order_token']})")
-                    return
-
-                else:
-                    send_message(chat_id, "⚠️ Не найден активный заказ в статусе 'Ожидает ввода'.")
-                    return
-
-            except Exception as e:
-                print(f"Admin input parsing error: {e}")
-                send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
-                return
 
 
 # --- MAIN APPLICATION (WSGI) ---
