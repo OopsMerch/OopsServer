@@ -12,11 +12,15 @@ from typing import Dict, Any
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
-# !!! НОВЫЕ ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ !!!
-# TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
-# ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
-# SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
-# TBANK_CARD = os.environ.get('TBANK_CARD', 'YYYY YYYY YYYY YYYY')
+
+# !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
+TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
+ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
+
+# ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
+SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
+TBANK_CARD = os.environ.get('TBANK_CARD', 'YYYY YYYY YYYY YYYY')
+ALFABANK_CARD = os.environ.get('ALFABANK_CARD', 'ZZZZ ZZZZ ZZZZ ZZZZ') # <-- НОВАЯ КАРТА
 
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
@@ -225,28 +229,27 @@ def generate_admin_order_message(order_data):
 
 
 def send_admin_order_notification(order_data):
-    # ! Замените на фактический ID вашей группы для заказов !
-    TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID', 'YOUR_ADMIN_GROUP_ID')
-    if TG_ADMIN_GROUP_ID.startswith('@'):
-         # Telegram API принимает чат ID в виде -100xxxxxxxxxx, 
-         # но для упрощения используем прямую отправку по username, если ID неизвестен.
-         # Если ID известен, используйте его: TG_ADMIN_GROUP_ID = '-100123456789'
-         chat_id = TG_ADMIN_GROUP_ID
-    else:
-        # Предполагаем, что это числовой ID
-        chat_id = int(TG_ADMIN_GROUP_ID)
-        
-    if chat_id == 'YOUR_ADMIN_GROUP_ID':
+    # ! Используем глобальную переменную, определенную в КОНФИГУРАЦИИ !
+    global TG_ADMIN_GROUP_ID 
+    
+    if not TG_ADMIN_GROUP_ID or TG_ADMIN_GROUP_ID == 'YOUR_ADMIN_GROUP_ID':
          print("Warning: TG_ADMIN_GROUP_ID is not set. Cannot send admin notification.")
          return
 
+    # Предполагаем, что TG_ADMIN_GROUP_ID - это числовой ID группы
+    try:
+        chat_id = int(TG_ADMIN_GROUP_ID)
+    except ValueError:
+        chat_id = TG_ADMIN_GROUP_ID # Оставляем как строку, если это username
+        
     message, reply_markup = generate_admin_order_message(order_data)
     send_message(chat_id, message, reply_markup=reply_markup)
     
 def send_payment_details(chat_id, order_data):
+    # Используем глобальные переменные, определенные в секции КОНФИГУРАЦИЯ
+    global SBERBANK_CARD, TBANK_CARD, ALFABANK_CARD
+
     total = order_data['total_amount']
-    SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
-    TBANK_CARD = os.environ.get('TBANK_CARD', 'YYYY YYYY YYYY YYYY')
 
     message = f"""
 🎉 **Прекрасно! Данные собраны!** 🎉
@@ -261,6 +264,9 @@ def send_payment_details(chat_id, order_data):
 
 2.  **Тинькофф** (Для РФ):
     `{TBANK_CARD}`
+    
+3.  **Альфа-Банк** (Для РФ):
+    `{ALFABANK_CARD}`
     
 ---
 **❗ После оплаты:**
@@ -459,9 +465,10 @@ def handle_telegram_update(conn, update):
                  
         # --- 3.5 ОБРАБОТКА ОТВЕТА АДМИНИСТРАТОРА В ГРУППЕ ---
         # Логика для админской группы (должна быть отдельной)
-        TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID', 'YOUR_ADMIN_GROUP_ID')
+        global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
+        
         # Проверяем, если сообщение пришло от администратора в группу и мы ожидаем ввод
-        if str(chat_id) == TG_ADMIN_GROUP_ID or chat_id == int(TG_ADMIN_GROUP_ID):
+        if str(chat_id) == TG_ADMIN_GROUP_ID or (TG_ADMIN_GROUP_ID and chat_id == int(TG_ADMIN_GROUP_ID)):
             # Ищем любой заказ в статусе STATUS_AWAITING_ADMIN
             # В идеале нужно привязать ответ к конкретному заказу (например, через Reply)
             # Но для упрощения возьмем последний заказ в этом статусе.
@@ -493,7 +500,6 @@ def handle_telegram_update(conn, update):
                         )
 
                         # Отправляем сообщение пользователю
-                        admin_support_username = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
                         
                         client_message = f"""
 ✅ **Ваш заказ оформлен!**
@@ -514,7 +520,7 @@ def handle_telegram_update(conn, update):
 ---
 📦 Если заканчивается срок хранения посылки на пункте выдачи - напишите нам для продления. Иначе за возврат удерживается сумма (за доставку к вам и обратно).
 
-🔗 По всем вопросам к администратору: {admin_support_username}
+🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
 """
                         send_message(int(order_to_update['user_tg_id']), client_message)
                         
