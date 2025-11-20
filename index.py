@@ -9,15 +9,13 @@ import hashlib
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
-# Переменные окружения будут автоматически загружены здесь
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
-# Убедитесь, что все эти переменные установлены в Render
-TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
-ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
+TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID')
+ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
 
 # ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
 SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
@@ -27,7 +25,7 @@ ALFABANK_CARD = os.environ.get('ALFABANK_CARD', 'ZZZZ ZZZZ ZZZZ ZZZZ')
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
 
-# CORS заголовки (разрешают запросы с вашего сайта)
+# CORS заголовки
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
     ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), 
@@ -50,7 +48,6 @@ STATUS_COMPLETED = 'completed'
 def create_psql_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set.")
-    # ИСПРАВЛЕНИЕ: Преобразуем postgres:// в postgresql:// для корректной работы psycopg2
     conn_url = DATABASE_URL.replace('postgres://', 'postgresql://')
     conn = psycopg2.connect(conn_url)
     conn.autocommit = True
@@ -79,7 +76,6 @@ def init_db(conn):
                 );
             """)
             
-            # Проверка и добавление новых колонок (если таблица существовала)
             def add_column_if_not_exists(col_name, col_type):
                 try:
                     cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ADD COLUMN {col_name} {col_type};")
@@ -103,11 +99,15 @@ def save_order_draft(conn, order_token, cart_data, total_amount):
         """
         cursor.execute(query, (order_token, STATUS_PENDING_AUTH, json.dumps(cart_data), total_amount))
 
-def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
+# --- ИСПРАВЛЕННАЯ ФУНКЦИЯ ОБНОВЛЕНИЯ ---
+# Переименовали аргумент фильтрации в filter_user_tg_id, чтобы он не конфликтовал с полем user_tg_id в kwargs
+def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
     if not kwargs: return False
     
     updates = ["updated_at = CURRENT_TIMESTAMP"]
     params = []
+    
+    # Теперь user_tg_id попадает сюда (в kwargs) и добавляется в запрос UPDATE
     for key, value in kwargs.items():
         if key == 'cart_data':
              updates.append(f"{key} = %s::jsonb")
@@ -119,10 +119,10 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
     if order_token:
         where_clause = "order_token = %s"
         params.append(order_token)
-    elif user_tg_id:
+    elif filter_user_tg_id:
         # Ищем только "активные" заказы по user_tg_id
         where_clause = f"user_tg_id = %s AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}')"
-        params.append(user_tg_id)
+        params.append(filter_user_tg_id)
     else:
         return False
         
@@ -133,9 +133,7 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         return cursor.rowcount > 0
 
 def get_order_by_tg_id(conn, user_tg_id):
-    # --- ОТЛАДКА ---
     print(f"DEBUG: Searching for active order for TG ID: {user_tg_id}") 
-    # ----------------
     
     query = f"""
     SELECT 
@@ -155,14 +153,10 @@ def get_order_by_tg_id(conn, user_tg_id):
         if row:
             columns = [desc[0] for desc in cursor.description]
             result = dict(zip(columns, row))
-            # --- ОТЛАДКА ---
             print(f"DEBUG: Order found (Token: {result['order_token']}, Status: {result['status']})")
-            # ----------------
             return result
         
-        # --- ОТЛАДКА ---
         print(f"DEBUG: No active order found for TG ID: {user_tg_id}") 
-        # ----------------
         return None
         
 def get_order_by_token(conn, order_token):
@@ -207,10 +201,8 @@ def generate_admin_order_message(order_data):
     else:
         cart_items = cart_data_raw
 
-    # Форматирование списка товаров
     items_list = "\n".join([f"- {item['quantity']} шт. | {item['name']} (Размер: {item['size']}, {item.get('price', 'N/A')} ₽/шт.)" for item in cart_items])
     
-    # Кнопка для администратора
     inline_keyboard = {
         "inline_keyboard": [
             [
@@ -308,7 +300,6 @@ def handle_telegram_update(conn, update):
                  
                  response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
                  
-                 # Редактируем сообщение, чтобы убрать кнопку
                  edit_message_url = TG_API_BASE + 'editMessageText'
                  requests.post(edit_message_url, json={
                     'chat_id': chat_id,
@@ -424,22 +415,12 @@ def handle_telegram_update(conn, update):
         
         phone = message['contact']['phone_number']
         
-        # Попытка обновления данных и проверка успеха
         if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
-            
-            # --- ОТЛАДКА ---
-            print(f"DEBUG: Order {order['order_token']} updated successfully with phone {phone}. Sending next prompt.") 
-            # ----------------
-            
+            print(f"DEBUG: Order updated with phone {phone}.") 
             remove_keyboard = {"remove_keyboard": True}
             send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
         else:
-            
-            # --- ОТЛАДКА ---
-            print(f"DEBUG: Order update FAILED for {order['order_token']} in PENDING_AUTH.") 
-            # ----------------
-            
-            send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
+            send_message(chat_id, "⚠️ Ошибка обновления заказа.", reply_markup={"remove_keyboard": True})
         
         return
 
@@ -449,11 +430,10 @@ def handle_telegram_update(conn, update):
         if len(params) > 1 and params[1].startswith('auth_'):
             order_token = params[1].replace('auth_', '')
             
-            # --- ОТЛАДКА: Проверяем, удалось ли записать user_tg_id ---
+            # ТЕПЕРЬ user_tg_id БУДЕТ ОБНОВЛЕН, Т.К. ОН ПОПАДЕТ В KWARGS
             update_success = update_order(conn, order_token=order_token, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH)
             
-            print(f"DEBUG: START command received. Token: {order_token}. Update success: {update_success}") 
-            # --------------------------------------------------------
+            print(f"DEBUG: START. Token: {order_token}. Success: {update_success}") 
 
             if update_success:
                 keyboard = {
@@ -516,7 +496,6 @@ def handle_telegram_update(conn, update):
 
         # --- 3.4 ОЖИДАНИЕ ФАЙЛА (ЧЕКА) ---
         elif current_status == STATUS_PENDING_PAYMENT:
-            # Принимаем любой файл (photo, document) или текст как подтверждение
             if 'photo' in message or 'document' in message or text:
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
                  
@@ -531,24 +510,21 @@ def handle_telegram_update(conn, update):
         
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
-        # Проверяем, что сообщение пришло именно из группы администратора
         if str(chat_id) == TG_ADMIN_GROUP_ID:
             
             try:
-                # Ожидаемый формат: ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА
                 parts = [x.strip() for x in text.split('|')]
                 if len(parts) != 3:
                      raise ValueError("Incorrect input format.")
                      
                 track_number, pvz_address, delivery_date_str = parts
 
-                # Ищем последний активный заказ в ожидании админа
                 order_to_update = None
                 with conn.cursor() as cur:
                      cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
                      row = cur.fetchone()
                      if row:
-                         columns = [desc[0] for desc in cursor.description]
+                         columns = [desc[0] for desc in cur.description]
                          order_to_update = dict(zip(columns, row))
 
                 if order_to_update:
@@ -584,7 +560,6 @@ def handle_telegram_update(conn, update):
                     send_message(chat_id, "⚠️ Не найден активный заказ в статусе 'Ожидает ввода'.")
                     return
 
-
             except Exception as e:
                 print(f"Admin input parsing error: {e}")
                 send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
@@ -597,7 +572,6 @@ def application(environ, start_response):
     method = environ.get('REQUEST_METHOD', 'GET')
     path = environ.get('PATH_INFO', '/')
     
-    # Health check
     if path == '/' and method in ['GET', 'HEAD']:
         start_response('200 OK', [('Content-type', 'text/plain')])
         return [b"Server is running"]
@@ -607,12 +581,10 @@ def application(environ, start_response):
         conn = create_psql_connection()
         init_db(conn) 
 
-        # CORS
         if method == 'OPTIONS':
             start_response('200 OK', CORS_HEADERS)
             return [b'']
 
-        # 1. INIT AUTH (Сайт -> Сервер)
         if method == 'POST' and path == '/init-auth':
             try:
                 size = int(environ.get('CONTENT_LENGTH', 0))
@@ -639,7 +611,6 @@ def application(environ, start_response):
                 start_response('500 Internal Server Error', CORS_HEADERS + [('Content-Type', 'application/json')])
                 return [json.dumps({'error': f"Internal Server Error: {str(e)}"}).encode('utf-8')]
 
-        # 2. WEBHOOK (Telegram -> Сервер)
         if method == 'POST' and path == '/webhook':
             try:
                 size = int(environ.get('CONTENT_LENGTH', 0))
@@ -651,12 +622,10 @@ def application(environ, start_response):
                 start_response('200 OK', [('Content-Type', 'text/plain')])
                 return [b'OK']
             except Exception as e:
-                # В случае ошибки всегда возвращаем 200 OK, чтобы Telegram не переотправлял
                 print(f"Webhook processing error: {e}") 
                 start_response('200 OK', [('Content-Type', 'text/plain')]) 
                 return [b'OK']
 
-        # 404 для всего остального
         start_response('404 Not Found', [('Content-Type', 'text/plain')])
         return [b'Not Found']
 
