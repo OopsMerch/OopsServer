@@ -4,21 +4,21 @@ import uuid
 import psycopg2 
 import psycopg2.errors
 import requests 
+import re
 from typing import Dict, Any
-import re 
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
-# Очистка ID группы от мусора (обязательно должно быть в формате -100...)
+# Очистка ID группы
 raw_admin_id = os.environ.get('TG_ADMIN_GROUP_ID', '')
 TG_ADMIN_GROUP_ID = str(raw_admin_id).strip().replace("'", "").replace('"', "")
 
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
 
-# ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ (ваши реальные данные)
+# Реквизиты
 SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
 TBANK_CARD = os.environ.get('TBANK_CARD', 'YYYY YYYY YYYY YYYY')
 ALFABANK_CARD = os.environ.get('ALFABANK_CARD', 'ZZZZ ZZZZ ZZZZ ZZZZ') 
@@ -32,7 +32,7 @@ CORS_HEADERS = [
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
-# --- МАШИНА СОСТОЯНИЙ ---
+# --- СТАТУСЫ ---
 STATUS_PENDING_AUTH = 'pending_phone_auth'
 STATUS_PENDING_FULL_NAME = 'pending_full_name'
 STATUS_PENDING_ADDRESS = 'pending_address'
@@ -56,7 +56,6 @@ def create_psql_connection():
 def init_db(conn):
     try:
         with conn.cursor() as cur:
-            # Создаем основную таблицу
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {ORDERS_TABLE_NAME} (
                     id SERIAL PRIMARY KEY,
@@ -77,31 +76,15 @@ def init_db(conn):
                 );
             """)
             
-            # --- РОБУСТНОЕ ИСПРАВЛЕНИЕ ОШИБКИ ДАТЫ (АВТОМАТИЧЕСКАЯ МИГРАЦИЯ) ---
-            # Повторяем попытку автоматической миграции, чтобы помочь тем, кто не может вручную
             try:
-                cur.execute(f"""
-                    SELECT data_type 
-                    FROM information_schema.columns 
-                    WHERE table_name = '{ORDERS_TABLE_NAME}' AND column_name = 'admin_delivery_date';
-                """)
+                cur.execute(f"SELECT data_type FROM information_schema.columns WHERE table_name = '{ORDERS_TABLE_NAME}' AND column_name = 'admin_delivery_date';")
                 result = cur.fetchone()
-                
                 if result and result[0] not in ('text', 'character varying'):
-                    print(f"MIGRATION: Column admin_delivery_date is currently {result[0]}. Altering to TEXT.")
-                    # Принудительная конвертация, игнорируя ошибки старых данных
-                    cur.execute(f"""
-                        ALTER TABLE {ORDERS_TABLE_NAME} 
-                        ALTER COLUMN admin_delivery_date TYPE TEXT USING admin_delivery_date::TEXT;
-                    """)
-                    print("MIGRATION: admin_delivery_date successfully altered to TEXT.")
-            except psycopg2.errors.UndefinedTable:
-                pass
+                    print(f"MIGRATION: Altering admin_delivery_date to TEXT.")
+                    cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ALTER COLUMN admin_delivery_date TYPE TEXT USING admin_delivery_date::TEXT;")
             except Exception as e:
-                print(f"MIGRATION ERROR (admin_delivery_date type fix): {e}")
+                print(f"Migration warning: {e}")
 
-
-            # Добавление недостающих колонок, если они не существуют
             def add_column_if_not_exists(col_name, col_type):
                 try:
                     cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ADD COLUMN {col_name} {col_type};")
@@ -119,10 +102,7 @@ def init_db(conn):
 
 def save_order_draft(conn, order_token, cart_data, total_amount):
     with conn.cursor() as cursor:
-        query = f"""
-        INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data, total_amount)
-        VALUES (%s, %s, %s, %s);
-        """
+        query = f"INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data, total_amount) VALUES (%s, %s, %s, %s);"
         cursor.execute(query, (order_token, STATUS_PENDING_AUTH, json.dumps(cart_data), total_amount))
 
 def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
@@ -130,10 +110,8 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
     updates = ["updated_at = CURRENT_TIMESTAMP"]
     params = []
     for key, value in kwargs.items():
-        if key == 'cart_data':
-             updates.append(f"{key} = %s::jsonb")
-        else:
-             updates.append(f"{key} = %s")
+        if key == 'cart_data': updates.append(f"{key} = %s::jsonb")
+        else: updates.append(f"{key} = %s")
         params.append(value)
         
     where_clause = ""
@@ -141,7 +119,6 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
         where_clause = "order_token = %s"
         params.append(order_token)
     elif filter_user_tg_id:
-        # Обновление только для активных заказов
         where_clause = f"user_tg_id = %s AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}')"
         params.append(filter_user_tg_id)
     else:
@@ -153,37 +130,17 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
         return cursor.rowcount > 0
 
 def get_order_by_tg_id(conn, user_tg_id):
-    query = f"""
-    SELECT 
-        order_token, status, total_amount, cart_data, phone_number, full_name, address, delivery_type, delivery_address_data, user_tg_id
-    FROM 
-        {ORDERS_TABLE_NAME}
-    WHERE 
-        user_tg_id = %s 
-        AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}', '{STATUS_PENDING_PAYMENT}', '{STATUS_AWAITING_ADMIN}')
-    ORDER BY 
-        created_at DESC
-    LIMIT 1;
-    """
+    query = f"SELECT * FROM {ORDERS_TABLE_NAME} WHERE user_tg_id = %s AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}', '{STATUS_PENDING_PAYMENT}', '{STATUS_AWAITING_ADMIN}') ORDER BY created_at DESC LIMIT 1;"
     with conn.cursor() as cursor:
         cursor.execute(query, (user_tg_id,))
         row = cursor.fetchone()
         if row:
             columns = [desc[0] for desc in cursor.description]
-            result = dict(zip(columns, row))
-            return result
+            return dict(zip(columns, row))
         return None
         
 def get_order_by_token(conn, order_token):
-    query = f"""
-    SELECT 
-        id, order_token, status, total_amount, cart_data, user_tg_id, phone_number, full_name, address, delivery_type, delivery_address_data
-    FROM 
-        {ORDERS_TABLE_NAME}
-    WHERE 
-        order_token = %s 
-    LIMIT 1;
-    """
+    query = f"SELECT * FROM {ORDERS_TABLE_NAME} WHERE order_token = %s LIMIT 1;"
     with conn.cursor() as cursor:
         cursor.execute(query, (order_token,))
         row = cursor.fetchone()
@@ -199,93 +156,101 @@ def send_message(chat_id, text, reply_markup=None):
     url = TG_API_BASE + 'sendMessage'
     payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
     if reply_markup:
-        if isinstance(reply_markup, dict):
-            payload['reply_markup'] = json.dumps(reply_markup)
-        else:
-            payload['reply_markup'] = reply_markup
-            
+        if isinstance(reply_markup, dict): payload['reply_markup'] = json.dumps(reply_markup)
+        else: payload['reply_markup'] = reply_markup
     try:
-        response = requests.post(url, json=payload)
-        print(f"DEBUG: Telegram sending to {chat_id}. Status: {response.status_code}. Response: {response.text}")
+        requests.post(url, json=payload)
     except Exception as e:
         print(f"Error sending message to {chat_id}: {e}")
 
+def forward_message(from_chat_id, message_id, to_chat_id):
+    url = TG_API_BASE + 'forwardMessage'
+    payload = {
+        'chat_id': to_chat_id,
+        'from_chat_id': from_chat_id,
+        'message_id': message_id
+    }
+    try:
+        requests.post(url, json=payload)
+    except Exception as e:
+        print(f"Error forwarding message: {e}")
+
 def generate_admin_order_message(order_data):
     cart_data_raw = order_data['cart_data']
-    if isinstance(cart_data_raw, str):
-        cart_items = json.loads(cart_data_raw)
-    else:
-        cart_items = cart_data_raw
+    if isinstance(cart_data_raw, str): cart_items = json.loads(cart_data_raw)
+    else: cart_items = cart_data_raw
 
-    items_list = "\n".join([f"- {item['quantity']} шт. | {item['name']} (Размер: {item['size']}, {item.get('price', 'N/A')} ₽/шт.)" for item in cart_items])
+    items_list = "\n".join([f"▫️ {item['quantity']} шт. | {item['name']} (Размер: {item['size']})" for item in cart_items])
     
     inline_keyboard = {
         "inline_keyboard": [
             [
-                {"text": "✅ Принять в обработку", "callback_data": f"admin_process_{order_data['order_token']}"}
+                {"text": "⚙️ Принять в работу", "callback_data": f"admin_process_{order_data['order_token']}"}
             ]
         ]
     }
 
     message = f"""
 🚨 **НОВЫЙ ЗАКАЗ** 🚨
-Токен: `{order_data['order_token']}`
-Сумма: **{order_data['total_amount']:.2f} ₽**
+`{order_data['order_token']}`
+
+💵 Сумма: **{order_data['total_amount']:.2f} ₽**
 
 ---
 **Пользовательские данные:**
 👤 ФИО: {order_data['full_name']}
-📱 Телефон: {order_data['phone_number']}
+📱 Телефон: `{order_data['phone_number']}`
 📧 TG ID: `{order_data['user_tg_id']}`
 
 ---
 **Доставка:**
-🚚 Тип: **{order_data['delivery_type']}**
+🚚 Тип: {order_data['delivery_type']}
 📍 Адрес/Пункт: {order_data['delivery_address_data'] or 'Не указан'}
 
 ---
 **Содержимое заказа:**
 {items_list}
+
+👇 **ЧЕК (Вложен ниже):**
 """
     return message, inline_keyboard
 
 
-def send_admin_order_notification(order_data):
+def send_admin_order_notification(order_data, receipt_message_id=None, user_chat_id=None):
     global TG_ADMIN_GROUP_ID 
-    
     if not TG_ADMIN_GROUP_ID or TG_ADMIN_GROUP_ID == 'YOUR_ADMIN_GROUP_ID':
-         print("Warning: TG_ADMIN_GROUP_ID is not set.")
          return
 
+    # 1. Текст заказа
     message, reply_markup = generate_admin_order_message(order_data)
     send_message(TG_ADMIN_GROUP_ID, message, reply_markup=reply_markup)
+
+    # 2. Пересылка чека (Файла)
+    if receipt_message_id and user_chat_id:
+        forward_message(user_chat_id, receipt_message_id, TG_ADMIN_GROUP_ID)
     
 def send_payment_details(chat_id, order_data):
     global SBERBANK_CARD, TBANK_CARD, ALFABANK_CARD
     total = order_data['total_amount']
     message = f"""
-🎉 **Прекрасно! Данные собраны!** 🎉
+💳 **Оплата заказа**
 
-Осталось только **оплатить заказ** на сумму:
-💰 **{total:.2f} ₽**
+Сумма к оплате: **{total:.2f} ₽**
 
-Выберите удобный способ оплаты:
+Пожалуйста, переведите точную сумму на одну из карт:
 
-1.  **Сбербанк** (Для РФ):
-    `{SBERBANK_CARD}`
+🟢 **Сбербанк (РФ):**
+`{SBERBANK_CARD}`
 
-2.  **Тинькофф** (Для РФ):
-    `{TBANK_CARD}`
-    
-3.  **Альфа-Банк** (Для РФ):
-    `{ALFABANK_CARD}`
-    
+🟡 **Тинькофф (РФ):**
+`{TBANK_CARD}`
+
+🔴 **Альфа-Банк (РФ):**
+`{ALFABANK_CARD}`
+
 ---
-**❗ После оплаты:**
-Пришлите скриншот или **чек-квитанцию файлом** в этот чат для подтверждения оплаты.
-Как только оплата будет подтверждена, мы передадим заказ в обработку.
-
-Спасибо за покупку!
+📎 **ВАЖНО:** Пришлите **ФАЙЛ** (документ/квитанцию) в этот чат для подтверждения. 
+_Обычные фото (картинки) не принимаются, только файлы._
 """
     remove_keyboard = {"remove_keyboard": True}
     send_message(chat_id, message, reply_markup=remove_keyboard)
@@ -305,13 +270,12 @@ def handle_telegram_update(conn, update):
             order_data = get_order_by_token(conn, order_token)
             
             if order_data and order_data['status'] == STATUS_AWAITING_ADMIN: 
-                 # ОБНОВЛЕННЫЙ ТЕКСТ ПОДСКАЗКИ ДЛЯ АДМИНА
-                 response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
-                 edit_message_url = TG_API_BASE + 'editMessageText'
-                 requests.post(edit_message_url, json={
+                 response_text = f"⚙️ **Обработка заказа** `{order_token}`\n\nСкопируйте шаблон, заполните и отправьте в ответ:\n\n`{order_token} | ТРЕК | ПВЗ | ДАТА`"
+                 
+                 requests.post(TG_API_BASE + 'editMessageText', json={
                     'chat_id': chat_id,
                     'message_id': message_id,
-                    'text': query['message']['text'] + '\n\n**Статус:** 🔄 Ожидает ввода данных от администратора',
+                    'text': query['message']['text'] + '\n\n✅ **Взято в работу**',
                     'parse_mode': 'Markdown',
                     'reply_markup': json.dumps({"inline_keyboard": []})
                  })
@@ -327,44 +291,61 @@ def handle_telegram_update(conn, update):
             
             if data == 'delivery_sdek' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
                 delivery_type = 'СДЭК'
-                delivery_info = f"Для **СДЭК** будет выбран ближайший пункт выдачи (ПВЗ) к указанному вами адресу: *{order['address']}*."
+                delivery_info = f"Для **СДЭК** мы подберем ближайший ПВЗ к адресу: _{order['address']}_"
             elif data == 'delivery_russian_post' and order['status'] == STATUS_PENDING_DELIVERY_TYPE:
                 delivery_type = 'Почта России'
-                delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
+                delivery_info = f"Для **Почты России** будет использован адрес: _{order['address']}_"
             
             if delivery_type:
                 update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
+                
                 confirmation_message = f"""
-✅ Способ получения: **{delivery_type}** выбран! 
+✅ **Способ доставки:** {delivery_type}
 {delivery_info}
 
 ---
-**Проверьте ваши данные:**
+📋 **Проверка данных:**
 👤 **ФИО:** {order['full_name']}
 📱 **Телефон:** {order['phone_number']}
 📍 **Адрес:** {order['address']}
-🚚 **Способ:** {delivery_type}
 
----
-**Подтвердите оформление заказа?**
+Все верно?
 """
-                keyboard = {"inline_keyboard": [[{"text": "✅ Подтвердить", "callback_data": "confirm_order"}], [{"text": "❌ Заполнить заново", "callback_data": "start_over"}]]}
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={'chat_id': chat_id, 'message_id': query['message']['message_id'], 'text': confirmation_message, 'parse_mode': 'Markdown', 'reply_markup': json.dumps(keyboard)})
+                keyboard = {"inline_keyboard": [[{"text": "✅ Всё верно, оплатить", "callback_data": "confirm_order"}], [{"text": "🔄 Заполнить заново", "callback_data": "start_over"}]]}
+                
+                requests.post(TG_API_BASE + 'editMessageText', json={
+                    'chat_id': chat_id, 
+                    'message_id': query['message']['message_id'], 
+                    'text': confirmation_message, 
+                    'parse_mode': 'Markdown', 
+                    'reply_markup': json.dumps(keyboard)
+                })
                 return
             
             elif data == 'confirm_order' and order['status'] == STATUS_PENDING_CONFIRMATION:
                 update_order(conn, order_token=order_token, status=STATUS_PENDING_PAYMENT)
                 send_payment_details(chat_id, order)
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={'chat_id': chat_id, 'message_id': query['message']['message_id'], 'text': query['message']['text'] + '\n\n**Статус:** ✅ **Подтверждено.** Ожидаем оплаты.', 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": []})})
+                
+                requests.post(TG_API_BASE + 'editMessageText', json={
+                    'chat_id': chat_id, 
+                    'message_id': query['message']['message_id'], 
+                    'text': query['message']['text'] + '\n\n✅ **Переход к оплате.**', 
+                    'parse_mode': 'Markdown', 
+                    'reply_markup': json.dumps({"inline_keyboard": []})
+                })
                 return
             
             elif data == 'start_over':
                 update_order(conn, order_token=order_token, full_name=None, address=None, delivery_type=None, status=STATUS_PENDING_FULL_NAME)
-                send_message(chat_id, "🔄 **Начинаем заново.** Введите ваше **ФИО** (Полностью):")
-                edit_message_url = TG_API_BASE + 'editMessageText'
-                requests.post(edit_message_url, json={'chat_id': chat_id, 'message_id': query['message']['message_id'], 'text': query['message']['text'] + '\n\n**Статус:** ❌ **Сброшено.**', 'parse_mode': 'Markdown', 'reply_markup': json.dumps({"inline_keyboard": []})})
+                send_message(chat_id, "🔄 **Начинаем заново.**\n\nВведите ваше **ФИО** (Фамилия Имя Отчество):")
+                
+                requests.post(TG_API_BASE + 'editMessageText', json={
+                    'chat_id': chat_id, 
+                    'message_id': query['message']['message_id'], 
+                    'text': query['message']['text'] + '\n\n🔄 **Сброс данных.**', 
+                    'parse_mode': 'Markdown', 
+                    'reply_markup': json.dumps({"inline_keyboard": []})
+                })
                 return
         return
         
@@ -374,83 +355,65 @@ def handle_telegram_update(conn, update):
     chat_id = message['chat']['id']
     text = message.get('text', '')
     
-    # Admin Logic Check (ОБНОВЛЕННАЯ ЛОГИКА)
+    # --- ADMIN LOGIC ---
     global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
     
     if str(chat_id) == TG_ADMIN_GROUP_ID:
-        print("DEBUG: Admin group detected. Parsing text...")
-        
-        # 1. Очистка текста: удаляем возможные префиксы (имя пользователя, цитаты) и берем только первую строку
         clean_text = text.split('\n')[0].strip()
-        
-        # 2. Разбиваем на 4 части по разделителю '|'. limit=3 гарантирует, что все, что идет после 3-го '|', попадет в последнюю часть (дата)
         parts = [x.strip() for x in clean_text.split('|', 3)]
         
-        if len(parts) != 4:
-             print(f"DEBUG: Admin text format incorrect. Parts found: {len(parts)}. Text: {clean_text}")
-             send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
-             return 
+        if len(parts) != 4: return
              
         try:
             order_token, track_number, pvz_address, delivery_date_str = parts
             
-            # --- УСИЛЕННАЯ ОЧИСТКА ТОКЕНА (для удаления префикса 'OOPS SUPPORT [24/7]: ') ---
-            # Ищем 12-значную последовательность букв и цифр (стандартный токен)
             match = re.search(r'([0-9a-fA-F]{12})', order_token)
-            if match:
-                order_token = match.group(1)
-            else:
-                # Резервный вариант: если токен не найден, берем последнюю часть
-                order_token = order_token.split(':')[-1].strip().split(' ')[-1].strip()
+            if match: order_token = match.group(1)
+            else: order_token = order_token.split(':')[-1].strip().split(' ')[-1].strip()
 
-            # Ищем заказ по токену
             order_to_update = get_order_by_token(conn, order_token) 
 
             if order_to_update and order_to_update['status'] == STATUS_AWAITING_ADMIN:
-                # Обновляем заказ и завершаем
-                # admin_delivery_date теперь TEXT, поэтому принимает любой ввод
                 update_order(conn, order_token=order_token, admin_track_number=track_number, delivery_address_data=pvz_address, admin_delivery_date=delivery_date_str, status=STATUS_COMPLETED)
                 
                 client_message = f"""
-✅ **Ваш заказ оформлен!** (Токен: `{order_token}`)
+✅ **Ваш заказ оформлен!**
 
-Вот **трек-номер**: `{track_number}`
+📦 **Трек-номер:** `{track_number}`
 
-Пункт выдачи: 
-*{pvz_address}*
+🏢 **Пункт выдачи:** {pvz_address}
 
-🕰️ Примерная дата получения:
-**{delivery_date_str}**
+⏳ **Ориентировочная дата:**
+{delivery_date_str}
 
 ---
-🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
+💌 _Спасибо за покупку!_
+Связь: {ADMIN_SUPPORT_USERNAME}
 """
                 send_message(int(order_to_update['user_tg_id']), client_message)
-                send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_token})")
+                send_message(chat_id, f"✅ Отправлено пользователю (Токен: `{order_token}`)")
                 return
-            elif order_to_update and order_to_update['status'] != STATUS_AWAITING_ADMIN:
-                send_message(chat_id, f"⚠️ Заказ с токеном `{order_token}` найден, но он находится в статусе: **{order_to_update['status']}** (ожидается не 'ввод админа').")
+            elif order_to_update:
+                send_message(chat_id, f"⚠️ Заказ `{order_token}` не ожидает подтверждения.")
                 return
             else:
-                send_message(chat_id, f"⚠️ Не найден активный заказ с токеном: `{order_token}`.")
+                send_message(chat_id, f"⚠️ Заказ `{order_token}` не найден.")
                 return
 
         except Exception as e:
-            # Ошибка БД будет поймана здесь, но миграция в init_db должна ее исправить
-            print(f"Admin input processing error: {e}")
-            send_message(chat_id, f"⚠️ **Ошибка обработки данных:** `{str(e).splitlines()[0]}`. Проверьте формат:\n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
+            print(f"Admin Error: {e}")
             return
     
-    # User Logic
+    # --- USER LOGIC ---
     order = get_order_by_tg_id(conn, str(chat_id))
     
     if 'contact' in message and order and order['status'] == STATUS_PENDING_AUTH:
         phone = message['contact']['phone_number']
         if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
             remove_keyboard = {"remove_keyboard": True}
-            send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
+            send_message(chat_id, "✅ Телефон принят!\n\nВведите **ФИО** (Фамилия Имя Отчество):", reply_markup=remove_keyboard)
         else:
-            send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
+            send_message(chat_id, "⚠️ Ошибка. Начните заново: /start", reply_markup={"remove_keyboard": True})
         return
 
     if text.startswith('/start'):
@@ -460,11 +423,11 @@ def handle_telegram_update(conn, update):
             update_success = update_order(conn, order_token=order_token, filter_user_tg_id=None, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH)
             if update_success:
                 keyboard = {"keyboard": [[{"text": "📱 Отправить номер телефона", "request_contact": True}]], "one_time_keyboard": True, "resize_keyboard": True}
-                send_message(chat_id, "👋 Привет! Мы получили ваш заказ.\nДля продолжения, пожалуйста, нажмите кнопку ниже, чтобы **подтвердить номер телефона**.", reply_markup=keyboard)
+                send_message(chat_id, "👋 **Привет!**\n\nДля оформления заказа нажмите кнопку ниже, чтобы подтвердить номер телефона:", reply_markup=keyboard)
             else:
-                send_message(chat_id, "⚠️ Ошибка: Заказ не найден или уже обработан.")
+                send_message(chat_id, "⚠️ Ссылка недействительна или заказ не найден.")
         else:
-            send_message(chat_id, "Используйте кнопку 'Оформить заказ' на сайте.")
+            send_message(chat_id, "👋 Перейдите на сайт, чтобы оформить заказ.")
         return
         
     if order:
@@ -473,32 +436,37 @@ def handle_telegram_update(conn, update):
         
         if current_status == STATUS_PENDING_FULL_NAME:
             full_name = text.strip()
-            if len(full_name) < 5 or len(full_name.split()) < 2:
-                 send_message(chat_id, "⚠️ Пожалуйста, введите полное **ФИО** (минимум Имя и Фамилия).")
+            if len(full_name.split()) < 2:
+                 send_message(chat_id, "⚠️ Введите полное ФИО.")
                  return
             update_order(conn, order_token=order_token, full_name=full_name, status=STATUS_PENDING_ADDRESS)
-            send_message(chat_id, "Спасибо, **ФИО** принято!\n\nВведите ваш **адрес** (например: *город, улица, дом, квартира*). \n\n*❗ Обратите внимание: Мы будем использовать этот адрес для выбора ближайшего пункта выдачи СДЭК или Почты России.*")
+            send_message(chat_id, "👍 Принято.\n\nТеперь введите **Адрес** (Город, Улица, Дом):")
             return
+
         elif current_status == STATUS_PENDING_ADDRESS:
             address = text.strip()
-            if len(address) < 10:
-                 send_message(chat_id, "⚠️ Пожалуйста, введите более полный и точный адрес.")
+            if len(address) < 5:
+                 send_message(chat_id, "⚠️ Введите более полный адрес.")
                  return
             update_order(conn, order_token=order_token, address=address, status=STATUS_PENDING_DELIVERY_TYPE)
-            keyboard = {"inline_keyboard": [[{"text": "🚚 СДЭК", "callback_data": "delivery_sdek"}], [{"text": "📬 Почта России", "callback_data": "delivery_russian_post"}]]}
-            send_message(chat_id, "✅ Адрес принят.\n\n**Выберите удобный способ получения заказа:**", reply_markup=keyboard)
+            keyboard = {"inline_keyboard": [[{"text": "🚛 СДЭК", "callback_data": "delivery_sdek"}], [{"text": "📬 Почта России", "callback_data": "delivery_russian_post"}]]}
+            send_message(chat_id, "✅ Адрес принят.\n\nВыберите **способ доставки**:", reply_markup=keyboard)
             return
-        elif current_status == STATUS_PENDING_DELIVERY_TYPE:
-             keyboard = {"inline_keyboard": [[{"text": "🚚 СДЭК", "callback_data": "delivery_sdek"}], [{"text": "📬 Почта России", "callback_data": "delivery_russian_post"}]]}
-             send_message(chat_id, "⚠️ Не удалось распознать способ. Выберите **СДЭК** или **Почта России**.", reply_markup=keyboard)
-             return
+
         elif current_status == STATUS_PENDING_PAYMENT:
-            if 'photo' in message or 'document' in message or text:
+            # --- СТРОГАЯ ПРОВЕРКА НА ФАЙЛ ---
+            if 'document' in message:
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
                  order_data_full = get_order_by_tg_id(conn, str(chat_id))
                  if order_data_full:
-                    send_admin_order_notification(order_data_full)
-                 send_message(chat_id, "✨ **Отлично!** Мы получили ваше подтверждение оплаты.\n\nПередаем заказ администратору для оформления доставки и трек-номера. Это займет некоторое время.")
+                    send_admin_order_notification(order_data_full, receipt_message_id=message['message_id'], user_chat_id=chat_id)
+                 send_message(chat_id, "✅ **Файл принят!**\n\nЗаказ передан администратору. Ожидайте трек-номер! ⏳")
+                 return
+            elif 'photo' in message:
+                 send_message(chat_id, "❌ **Ошибка формата!**\n\nВы прислали изображение как фото.\nПожалуйста, отправьте чек **ФАЙЛОМ** (Скрепка -> Файл).")
+                 return
+            else:
+                 send_message(chat_id, "⚠️ Пожалуйста, прикрепите **Файл** с квитанцией об оплате.")
                  return
 
 # --- MAIN ---
