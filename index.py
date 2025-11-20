@@ -15,6 +15,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
+# Убедитесь, что все эти переменные установлены в Render
 TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
 
@@ -131,7 +132,6 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         cursor.execute(query, params)
         return cursor.rowcount > 0
 
-# ВКЛЮЧАЕТ 'user_tg_id' В SELECT
 def get_order_by_tg_id(conn, user_tg_id):
     query = f"""
     SELECT 
@@ -195,8 +195,10 @@ def generate_admin_order_message(order_data):
     else:
         cart_items = cart_data_raw
 
+    # Форматирование списка товаров
     items_list = "\n".join([f"- {item['quantity']} шт. | {item['name']} (Размер: {item['size']}, {item.get('price', 'N/A')} ₽/шт.)" for item in cart_items])
     
+    # Кнопка для администратора
     inline_keyboard = {
         "inline_keyboard": [
             [
@@ -214,7 +216,7 @@ def generate_admin_order_message(order_data):
 **Пользовательские данные:**
 👤 ФИО: {order_data['full_name']}
 📱 Телефон: {order_data['phone_number']}
-📧 TG ID: `{order_data['user_tg_id']}` # <-- ДОСТУП К ПОЛЮ ИСПРАВЛЕН
+📧 TG ID: `{order_data['user_tg_id']}`
 
 ---
 **Доставка:**
@@ -407,10 +409,26 @@ def handle_telegram_update(conn, update):
     
     # 1. ОБРАБОТКА КОНТАКТА
     if 'contact' in message and order and order['status'] == STATUS_PENDING_AUTH:
+        
         phone = message['contact']['phone_number']
-        update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME)
-        remove_keyboard = {"remove_keyboard": True}
-        send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
+        
+        # Попытка обновления данных и проверка успеха
+        if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
+            
+            # --- ОТЛАДОЧНЫЙ ВЫВОД ---
+            print(f"DEBUG: Order {order['order_token']} updated successfully with phone {phone}. Sending next prompt.") 
+            # ------------------------
+            
+            remove_keyboard = {"remove_keyboard": True}
+            send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
+        else:
+            
+            # --- ОТЛАДОЧНЫЙ ВЫВОД ---
+            print(f"DEBUG: Order update FAILED for {order['order_token']} in PENDING_AUTH.") 
+            # ------------------------
+            
+            send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
+        
         return
 
     # 2. ОБРАБОТКА КОМАНДЫ START
@@ -484,7 +502,6 @@ def handle_telegram_update(conn, update):
             if 'photo' in message or 'document' in message or text:
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
                  
-                 # Повторная выборка для получения всех данных, включая обновленный статус
                  order_data_full = get_order_by_tg_id(conn, str(chat_id))
                  if order_data_full:
                     send_admin_order_notification(order_data_full)
@@ -496,6 +513,7 @@ def handle_telegram_update(conn, update):
         
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
+        # Проверяем, что сообщение пришло именно из группы администратора
         if str(chat_id) == TG_ADMIN_GROUP_ID:
             
             try:
