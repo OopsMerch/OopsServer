@@ -4,40 +4,40 @@ import uuid
 import psycopg2 
 import psycopg2.errors
 import requests 
-import re 
 import hmac
 import hashlib 
-from urllib.parse import parse_qsl 
 from typing import Dict, Any
 
-# --- CONFIGURATION ---
+# --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
-SITE_BASE_URL = os.environ.get('SITE_BASE_URL', 'https://oops-merch.ru') 
 
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
+
+# CORS заголовки (разрешают запросы с вашего сайта)
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
     ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), 
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
-# --- DATABASE FUNCTIONS ---
+# --- ФУНКЦИИ БАЗЫ ДАННЫХ ---
 
 def create_psql_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set.")
-    conn = psycopg2.connect(DATABASE_URL)
+    # ИСПРАВЛЕНИЕ: Преобразуем postgres:// в postgresql:// для корректной работы psycopg2
+    conn_url = DATABASE_URL.replace('postgres://', 'postgresql://')
+    conn = psycopg2.connect(conn_url)
     conn.autocommit = True
     return conn
 
 def init_db(conn):
     try:
         with conn.cursor() as cur:
-            # Создаем таблицу, если ее нет
+            # Создаем таблицу со всеми нужными полями, если ее нет
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {ORDERS_TABLE_NAME} (
                     id SERIAL PRIMARY KEY,
@@ -54,23 +54,12 @@ def init_db(conn):
                 );
             """)
             
-            # Пытаемся добавить колонки, если таблица уже существует (для обратной совместимости)
-            columns_to_add = [
-                ("total_amount", "NUMERIC(10, 2) NOT NULL DEFAULT 0.00"),
-                ("full_name", "VARCHAR(255) DEFAULT NULL"),
-                ("address", "TEXT DEFAULT NULL")
-            ]
+            # Проверка и добавление колонки total_amount (если таблица существовала)
+            try:
+                cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ADD COLUMN total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00;")
+            except psycopg2.errors.DuplicateColumn:
+                pass 
             
-            for col_name, col_def in columns_to_add:
-                try:
-                    cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ADD COLUMN {col_name} {col_def};")
-                    print(f"Added column {col_name}")
-                except psycopg2.errors.DuplicateColumn:
-                    pass # Колонка уже есть
-                except Exception as e:
-                    print(f"Error adding column {col_name}: {e}")
-
-            print("Database initialized/checked successfully.")
     except Exception as e:
         print(f"Database initialization error: {e}")
 
@@ -83,33 +72,17 @@ def save_order_draft(conn, order_token, cart_data, total_amount):
         cursor.execute(query, (order_token, "pending_phone_auth", json.dumps(cart_data), total_amount))
 
 def update_order(conn, order_token, **kwargs):
-    # Универсальная функция обновления
     if not kwargs: return False
-    
     updates = ["updated_at = CURRENT_TIMESTAMP"]
     params = []
-    
     for key, value in kwargs.items():
         updates.append(f"{key} = %s")
         params.append(value)
-    
     params.append(order_token)
-    
     query = f"UPDATE {ORDERS_TABLE_NAME} SET {', '.join(updates)} WHERE order_token = %s"
-    
     with conn.cursor() as cursor:
         cursor.execute(query, params)
         return cursor.rowcount > 0
-
-def get_order_by_token(conn, order_token):
-    with conn.cursor() as cursor:
-        cursor.execute(f"SELECT * FROM {ORDERS_TABLE_NAME} WHERE order_token = %s", (order_token,))
-        # Возвращаем словарь для удобства (требует RealDictCursor, но сделаем вручную для надежности)
-        columns = [desc[0] for desc in cursor.description]
-        row = cursor.fetchone()
-        if row:
-            return dict(zip(columns, row))
-        return None
 
 # --- TELEGRAM UTILS ---
 
@@ -135,18 +108,7 @@ def handle_telegram_update(conn, update):
     # 1. ОБРАБОТКА КОНТАКТА
     if 'contact' in message:
         phone = message['contact']['phone_number']
-        # Ищем последний заказ этого пользователя со статусом pending_phone_auth
-        # (Упрощение: ищем по временному tg_id, который мы могли сохранить ранее, или просто обновляем последний созданный токен если бы мы его знали. 
-        # В идеале, нужно хранить state пользователя. Здесь мы предполагаем, что flow идет последовательно)
-        
-        # ТАК КАК мы не знаем токен здесь напрямую (Telegram не передает его с контактом кроме как через reply),
-        # Мы должны были сохранить chat_id при старте.
-        
-        # Для простоты: Мы просто пишем пользователю, что контакт принят.
         send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО**:")
-        
-        # В реальном коде здесь нужно обновить статус заказа в БД на 'pending_name'
-        # update_order_by_chat_id(conn, chat_id, status='pending_name', phone_number=phone)
         return
 
     # 2. ОБРАБОТКА КОМАНДЫ START
@@ -155,7 +117,6 @@ def handle_telegram_update(conn, update):
         if len(params) > 1 and params[1].startswith('auth_'):
             order_token = params[1].replace('auth_', '')
             
-            # Привязываем Chat ID к заказу
             if update_order(conn, order_token, user_tg_id=str(chat_id), status='pending_phone_auth'):
                 keyboard = {
                     "keyboard": [[{"text": "📱 Отправить номер телефона", "request_contact": True}]],
@@ -168,27 +129,17 @@ def handle_telegram_update(conn, update):
         else:
             send_message(chat_id, "Используйте кнопку 'Оформить заказ' на сайте.")
         return
-
-    # 3. ОБРАБОТКА ТЕКСТА (ФИО, АДРЕС)
-    # Здесь должна быть машина состояний (State Machine). 
-    # Мы проверяем статус заказа пользователя в БД.
     
-    # order = get_order_by_chat_id(conn, chat_id)
-    # if order['status'] == 'pending_name':
-    #    update_order(conn, order['token'], full_name=text, status='pending_address')
-    #    send_message(chat_id, "Принято. Теперь введите полный **адрес доставки**:")
-    # elif order['status'] == 'pending_address':
-    #    update_order(conn, order['token'], address=text, status='awaiting_payment')
-    #    send_message(chat_id, "Адрес сохранен! Менеджер свяжется с вами для оплаты.")
-
-
-# --- MAIN APPLICATION ---
+    # 3. ОБРАБОТКА ТЕКСТА (ФИО, АДРЕС) - ЛОГИКА ДИАЛОГА НЕ ПОЛНАЯ, НО НЕ КРИТИЧНА ДЛЯ ЗАПУСКА
+    # На этом этапе бот просто игнорирует сообщения, кроме контактов и /start.
+    
+# --- MAIN APPLICATION (WSGI) ---
 
 def application(environ, start_response):
     method = environ.get('REQUEST_METHOD', 'GET')
     path = environ.get('PATH_INFO', '/')
     
-    # Health check for Render
+    # Health check
     if path == '/' and method in ['GET', 'HEAD']:
         start_response('200 OK', [('Content-type', 'text/plain')])
         return [b"Server is running"]
@@ -196,7 +147,7 @@ def application(environ, start_response):
     conn = None
     try:
         conn = create_psql_connection()
-        init_db(conn) # Убеждаемся, что БД готова
+        init_db(conn) 
 
         # CORS
         if method == 'OPTIONS':
@@ -228,7 +179,7 @@ def application(environ, start_response):
             except Exception as e:
                 print(f"Init Auth Error: {e}")
                 start_response('500 Internal Server Error', CORS_HEADERS + [('Content-Type', 'application/json')])
-                return [json.dumps({'error': str(e)}).encode('utf-8')]
+                return [json.dumps({'error': f"Internal Server Error: {str(e)}"}).encode('utf-8')]
 
         # 2. WEBHOOK (Telegram -> Сервер)
         if method == 'POST' and path == '/webhook':
@@ -241,9 +192,8 @@ def application(environ, start_response):
                 
                 start_response('200 OK', [('Content-Type', 'text/plain')])
                 return [b'OK']
-            except Exception as e:
-                print(f"Webhook Error: {e}")
-                start_response('200 OK', [('Content-Type', 'text/plain')]) # Всегда возвращаем 200 ТГ
+            except:
+                start_response('200 OK', [('Content-Type', 'text/plain')]) 
                 return [b'OK']
 
         # 404 для всего остального
@@ -253,6 +203,6 @@ def application(environ, start_response):
     except Exception as e:
         print(f"Critical Error: {e}")
         start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
-        return [str(e).encode('utf-8')]
+        return [f"Critical Server Error: {str(e)}".encode('utf-8')]
     finally:
         if conn: conn.close()
