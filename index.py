@@ -327,4 +327,3 @@ def application(environ, start_response):
         # Закрываем соединение с БД
         if conn:
             conn.close()
-й
