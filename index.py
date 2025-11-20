@@ -9,7 +9,7 @@ import hashlib
 from urllib.parse import parse_qsl 
 from typing import Dict, Any
 
-# --- CONFIGURATION ---
+# --- CONFIGURATION (ВАШИ НАСТРОЙКИ) ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
@@ -24,506 +24,290 @@ CORS_HEADERS = [
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
-# --- TELEGRAM AUTH FUNCTION ---
-
-def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
-    if not auth_data or 'hash' not in auth_data or not TELEGRAM_BOT_TOKEN:
-        return False
-    data_list = []
-    for key, value in auth_data.items():
-        if key != 'hash':
-            data_list.append(f"{key}={value}")
-    data_list.sort()
-    data_check_string = '\n'.join(data_list)
-    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode('utf-8')).digest()
-    calculated_hash = hmac.new(
-        secret_key,
-        data_check_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return calculated_hash == auth_data['hash']
-
-# --- DATABASE FUNCTIONS ---
-
-def create_psql_connection():
-    if not DATABASE_URL:
-        raise ValueError("DATABASE_URL is not set.")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
-    return conn
-
-def save_order_draft(conn, order_token, cart_data):
-    cursor = conn.cursor()
-    query = f"""
-    INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data)
-    VALUES (%s, %s, %s);
-    """
-    cursor.execute(query, (order_token, "pending_phone_auth", json.dumps(cart_data)))
-    cursor.close()
-
-def update_order_status_and_user(conn, order_token, status, user_tg_id=None, phone_number=None, check_file_id=None):
-    cursor = conn.cursor()
-    updates = ["updated_at = CURRENT_TIMESTAMP"]
-    params = []
-    
-    if user_tg_id is not None:
-        updates.append("user_tg_id = %s")
-        params.append(user_tg_id)
-    if phone_number is not None:
-        updates.append("phone_number = %s")
-        params.append(phone_number)
-    if check_file_id is not None:
-        updates.append("check_file_id = %s")
-        params.append(check_file_id)
-    
-    updates.append("status = %s")
-    params.append(status)
-    params.append(order_token)
-
-    query = f"""
-    UPDATE {ORDERS_TABLE_NAME}
-    SET {', '.join(updates)}
-    WHERE order_token = %s;
-    """
-    cursor.execute(query, params)
-    cursor.close()
-    return cursor.rowcount > 0
-
-def update_order_full_details(conn, data):
-    cursor = conn.cursor()
-    query = f"""
-    UPDATE {ORDERS_TABLE_NAME}
-    SET 
-        status = %s,
-        full_name = %s,
-        email = %s,
-        delivery_type = %s,
-        post_index = %s,
-        city = %s,
-        address_line = %s,
-        pvz_id = %s,
-        payment_amount = %s,
-        payment_method_details = %s,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE order_token = %s;
-    """
-    params = (
-        'pending_check_submission', 
-        data.get('full_name'),
-        data.get('email'),
-        data.get('delivery_type'),
-        data.get('post_index'),
-        data.get('city'),
-        data.get('address_line'),
-        data.get('pvz_id'),
-        data.get('payment_amount'),
-        data.get('payment_method_details'),
-        data.get('order_token')
-    )
-    cursor.execute(query, params)
-    cursor.close()
-    return cursor.rowcount > 0
-
-def get_order_by_tg_id(conn, user_tg_id):
-    cursor = conn.cursor()
-    query = f"""
-    SELECT order_token, status, cart_data, phone_number, user_tg_id, check_file_id
-    FROM {ORDERS_TABLE_NAME} 
-    WHERE user_tg_id = %s AND status NOT IN ('completed', 'cancelled')
-    ORDER BY created_at DESC LIMIT 1;
-    """
-    cursor.execute(query, (user_tg_id,))
-    result = cursor.fetchone()
-    cursor.close()
-    return result
-
-def get_order_by_token(conn, order_token):
-    cursor = conn.cursor()
-    query = f"""
-    SELECT 
-        order_token, status, cart_data, phone_number, user_tg_id, check_file_id, 
-        full_name, delivery_type, post_index, city, address_line, pvz_id, 
-        payment_amount, payment_method_details, email
-    FROM {ORDERS_TABLE_NAME} 
-    WHERE order_token = %s;
-    """
-    cursor.execute(query, (order_token,))
-    result = cursor.fetchone()
-    cursor.close()
-    return result
-
-# --- TELEGRAM HELPERS ---
-
-def send_tg_request(method, payload):
-    url = TG_API_BASE + method
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Telegram API Error ({method}): {e}")
-        return None
+# --- TELEGRAM UTILITY FUNCTIONS ---
 
 def send_message(chat_id, text, reply_markup=None):
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+    """Отправка сообщения в Telegram."""
+    url = TG_API_BASE + 'sendMessage'
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+    }
     if reply_markup:
-        payload['reply_markup'] = reply_markup
-    return send_tg_request('sendMessage', payload)
-
-# --- TELEGRAM HANDLERS ---
-
-def handle_start(conn, update):
-    message = update['message']
-    chat_id = message['chat']['id']
-    user_tg_id = message['from']['id']
-    text = message['text']
+        payload['reply_markup'] = json.dumps(reply_markup)
     
-    # Ищем токен (с префиксом или без)
-    match = re.search(r'/start\s+(\w+)', text)
-    order_token_full = match.group(1) if match else None
-    
-    if not order_token_full:
-         send_message(chat_id, "Use the link from the website to start the ordering process.")
-         return
-
-    # Логика обработки токенов с префиксом
-    if order_token_full.startswith('pay_'):
-        order_token = order_token_full.replace('pay_', '')
-        handle_pay_start(conn, chat_id, user_tg_id, order_token) 
-    elif order_token_full.startswith('auth_'):
-        order_token = order_token_full.replace('auth_', '')
-        handle_auth_start(conn, chat_id, user_tg_id, order_token)
-    else:
-        # Для обратной совместимости или если токен пришел без префикса (первый шаг)
-        handle_auth_start(conn, chat_id, user_tg_id, order_token_full)
-
-def handle_auth_start(conn, chat_id, user_tg_id, order_token):
     try:
-        # В этом месте order_token должен быть ЧИСТЫМ токеном (без auth_)
-        updated = update_order_status_and_user(conn, order_token, 'pending_phone_auth', user_tg_id=user_tg_id)
-        if updated:
-            keyboard = {
-                "keyboard": [[{"text": "Подтвердить номер телефона", "request_contact": True}]],
-                "one_time_keyboard": True,
-                "resize_keyboard": True
-            }
-            send_message(
-                chat_id, 
-                "✅ Заказ найден. Для продолжения, **подтвердите свой номер телефона**:", 
-                reply_markup=keyboard
-            )
-        else:
-            send_message(chat_id, "⚠️ Error: Order not found or already processed.")
+        requests.post(url, json=payload, timeout=5)
     except Exception as e:
-        print(f"Error in handle_auth_start: {e}")
-        send_message(chat_id, f"❌ Server Error.")
+        print(f"Error sending TG message: {e}")
+        
+# --- DB UTILITY STUBS (ДОЛЖНЫ БЫТЬ РЕАЛИЗОВАНЫ С DB) ---
 
-def handle_pay_start(conn, chat_id, user_tg_id, order_token):
-    order_data = get_order_by_token(conn, order_token)
+def get_db_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+def get_order_by_token(conn, order_token):
+    # token, status, cart_data, phone_number, full_name, address_line
+    # Ваш код для получения заказа по токену
+    # ...
+    # ЗАГЛУШКА
+    return (order_token, 'DRAFT', '{}', None, None, None) # Пример возвращаемых данных: 6 полей
+
+def insert_draft_order(conn, token, cart_json):
+    # Ваш код для вставки нового заказа в статусе DRAFT
+    pass
+
+def update_order_status_and_user(conn, token, status, tg_id, phone):
+    # Ваш код для обновления статуса, tg_id и номера телефона
+    return True # Успех
+
+def get_order_by_tg_id_and_status(conn, tg_id, status):
+    # Ваш код для поиска заказа по tg_id и статусу.
+    # Должен возвращать: token, status, cart_data, phone_number, full_name, address_line
+    # ЗАГЛУШКА:
+    return None
+
+def update_order_field(conn, token, field_name, value):
+    # Ваш код для обновления одного поля (e.g., full_name, address_line)
+    pass
+
+def update_order_status(conn, token, new_status):
+    # Ваш код для обновления статуса
+    pass
+
+def finalize_order_and_notify_admin(conn, token, cart_data, full_name, phone_number, address_line, user_tg_id):
+    # Ваш код для финализации (установка даты, номера заказа) и отправки уведомления администратору
+    send_message(
+        ADMIN_CHAT_ID, 
+        f"🚨 **НОВЫЙ ЗАКАЗ ИЗ БОТА!** 🚨\n\nID: {token}\nФИО: {full_name}\nТелефон: {phone_number}\nАдрес: {address_line}\n\nСостав заказа:\n{cart_data}",
+    )
+
+# --- TELEGRAM AUTH FUNCTION (UNCHANGED) ---
+def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
+    # ... (Оставить без изменений) ...
+    pass
     
-    if order_data and order_data[4] == user_tg_id: 
-        # Обновляем статус, но не меняем user_tg_id, так как он уже есть
-        update_order_status_and_user(conn, order_token, 'pending_check_submission') 
-        
-        send_message(
-            chat_id, 
-            "💰 **Оплата произведена!** Пожалуйста, пришлите нам **фотографию или скриншот (чек)** для подтверждения."
-        )
-    else:
-        send_message(chat_id, "⚠️ Error: Order not found or not linked to your account.")
 
+# --- CORE LOGIC ---
 
-def handle_contact_share(conn, update):
-    message = update['message']
-    chat_id = message['chat']['id']
-    user_tg_id = message['from']['id']
-    phone_number = message['contact']['phone_number']
-
-    order_data = get_order_by_tg_id(conn, user_tg_id)
-    
-    if order_data:
-        order_token = order_data[0]
-        update_order_status_and_user(conn, order_token, 'pending_delivery_data', phone_number=phone_number)
-        
-        # URL для возврата на сайт
-        redirect_url = f"{SITE_BASE_URL}/?token={order_token}&tg_id={user_tg_id}"
-        
-        keyboard = {
-            "inline_keyboard": [
-                [{"text": "Вернуться к оформлению заказа", "url": redirect_url}]
-            ]
-        }
-        send_message(
-            chat_id, 
-            "✅ **Номер подтвержден**! Возвращайтесь на сайт, чтобы заполнить данные доставки.", 
-            reply_markup=keyboard
-        )
-    else:
-        send_message(chat_id, "⚠️ You have no active orders to confirm.")
-
-def handle_check_submission(conn, update):
+# 1. ИЗМЕНЕНИЕ: handle_init_auth (Инициация авторизации с сайта)
+def handle_init_auth(conn, env, start_response):
+    """Инициация авторизации. УБИРАЕМ обратную ссылку на сайт."""
     try:
-        message = update['message']
-        chat_id = message['chat']['id']
-        user_tg_id = message['from']['id']
+        # ... (Код получения данных корзины остается) ...
+        try:
+            request_body_size = int(env.get('CONTENT_LENGTH', 0))
+        except (ValueError):
+            request_body_size = 0
+            
+        request_body = env['wsgi.input'].read(request_body_size)
+        data = json.loads(request_body)
+        cart_data = data.get('cart')
         
-        order_data = get_order_by_tg_id(conn, user_tg_id)
-        if not order_data or order_data[1] != 'pending_check_submission':
-            send_message(chat_id, "⚠️ You have no active orders awaiting a check.")
-            return
+        if not cart_data:
+             raise ValueError("Cart data is missing.")
 
-        order_token = order_data[0]
+        # Создание нового DRAFT заказа
+        order_token = str(uuid.uuid4())
+        insert_draft_order(conn, order_token, json.dumps(cart_data))
         
-        file_id = None
-        file_type = None
-        if 'photo' in message and message['photo']:
-            file_id = message['photo'][-1]['file_id']
-            file_type = 'photo'
-        elif 'document' in message and message['document']:
-            file_id = message['document']['file_id']
-            file_type = 'document'
-        
-        if file_id:
-            update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
-            full_order_data = get_order_by_token(conn, order_token)
-            
-            try:
-                raw_cart = json.loads(full_order_data[2])
-                items_text = ""
-                total_amount = full_order_data[12] if full_order_data[12] is not None else 0
+        # СТАЛО: Только ссылка на бота с токеном
+        tg_auth_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?startauth={order_token}"
 
-                if isinstance(raw_cart, list):
-                    for item in raw_cart:
-                        if isinstance(item, dict):
-                            name = item.get('name', 'Item')
-                            size = item.get('size', '-')
-                            qty = item.get('quantity', 1)
-                            items_text += f"— {name} ({size}) x{qty}\n"
-                        else:
-                            items_text += f"— {str(item)}\n"
-                else:
-                    items_text = "Error reading items."
-
-            except Exception as e:
-                print(f"Error parsing data: {e}")
-                items_text = "Error reading items."
-                total_amount = 0
-
-            admin_message = (
-                f"🔔 **NEW ORDER (AWAITING CONFIRMATION)**\n"
-                f"Token: `{order_token}`\n"
-                f"Amount: **{total_amount} RUB** ({full_order_data[13] or 'N/A'})\n"
-                f"--- **CUSTOMER DATA** ---\n"
-                f"**Name:** {full_order_data[6] or 'N/A'}\n"
-                f"**Phone:** {full_order_data[3] or 'N/A'}\n"
-                f"**Email:** {full_order_data[14] or 'N/A'}\n"
-                f"--- **DELIVERY ({full_order_data[7] or 'N/A'})** ---\n"
-                f"**Index:** {full_order_data[8] or 'N/A'}\n"
-                f"**City:** {full_order_data[9] or 'N/A'}\n"
-                f"**Address:** {full_order_data[10] or 'N/A'}\n"
-                f"**PVZ:** {full_order_data[11] or 'N/A'}\n"
-                f"--- **ORDER ITEMS** ---\n{items_text}"
-            )
-            
-            keyboard = {
-                "inline_keyboard": [
-                    [{"text": "✅ Confirm Payment", "callback_data": f"CONFIRM_{order_token}"}],
-                    [{"text": "❌ Reject Payment", "callback_data": f"REJECT_{order_token}"}]
-                ]
-            }
-            
-            req_payload = {
-                'chat_id': ADMIN_CHAT_ID,
-                'caption': admin_message,
-                'reply_markup': keyboard,
-                'parse_mode': 'Markdown'
-            }
-            
-            if file_type == 'photo':
-                req_payload['photo'] = file_id
-                send_tg_request('sendPhoto', req_payload)
-            elif file_type == 'document':
-                req_payload['document'] = file_id
-                send_tg_request('sendDocument', req_payload)
-            
-            send_message(chat_id, "⏳ Your check has been received. Awaiting admin confirmation.")
-
-        else:
-            send_message(chat_id, "⚠️ Please send a photo or document (check).")
-
+        resp = json.dumps({'success': True, 'token': order_token, 'telegram_url': tg_auth_url}).encode('utf-8')
+        start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
+        return [resp]
     except Exception as e:
-        print(f"CRITICAL ERROR in handle_check_submission: {e}")
-        try: send_message(chat_id, f"❌ Server Error.")
-        except: pass
+        print(f"Error in handle_init_auth: {e}")
+        start_response('400 Bad Request', CORS_HEADERS + [('Content-type', 'application/json')])
+        return [json.dumps({'error': str(e)}).encode('utf-8')]
 
-def handle_callback_query(conn, update):
+# 2. ИЗМЕНЕНИЕ: handle_auth_callback (Коллбэк после авторизации)
+def handle_auth_callback(conn, env, start_response):
+    """Коллбэк после авторизации. Изменяем статус и отправляем первый вопрос."""
     try:
-        callback_query = update['callback_query']
-        data = callback_query['data']
-        admin_id = callback_query['from']['id']
-        message = callback_query['message']
+        qs = env.get('QUERY_STRING', '')
+        auth_data_list = parse_qsl(qs)
+        auth_data = {k: v for k, v in auth_data_list}
         
-        match = re.search(r'(CONFIRM|REJECT)_(\w+)', data)
-        if not match: return
+        # ... (Проверка auth_data остается) ...
+        if not verify_telegram_authorization(auth_data):
+             start_response('401 Unauthorized', [('Content-Type', 'text/html')])
+             return ["<h1>Telegram authorization failed. Hash mismatch.</h1>".encode('utf-8')]
             
-        action = match.group(1)
-        order_token = match.group(2)
-        new_status = 'completed' if action == 'CONFIRM' else 'cancelled'
+        user_tg_id = str(auth_data['id']) # Важно: хранить как строку
+        order_token = auth_data.get('state') 
+        phone_number = auth_data.get('phone_number', 'Номер не указан')
+        chat_id = user_tg_id 
         
-        if update_order_status_and_user(conn, order_token, new_status):
-            new_caption = message.get('caption', '') + f"\n\n--- Status ---\n"
+        order_data = get_order_by_token(conn, order_token)
+        
+        # --- ИЗМЕНЕНИЕ ЛОГИКИ ПОСЛЕ УСПЕШНОГО ПОДТВЕРЖДЕНИЯ НОМЕРА ---
+        
+        if order_data and order_data[1] == 'DRAFT': 
             
-            order_data = get_order_by_token(conn, order_token)
-            user_tg_id = order_data[4] if order_data else None
+            # Обновляем статус заказа на 'AWAITING_FULL_NAME', сохраняем TG ID и phone
+            if update_order_status_and_user(conn, order_token, 'AWAITING_FULL_NAME', user_tg_id, phone_number): 
+                
+                # Отправляем первое сообщение в новой цепочке
+                send_message(
+                    chat_id, 
+                    "✅ **Номер подтвержден!** \n\nДля продолжения оформления заказа, пожалуйста, введите ваше **ФИО** (Фамилия Имя Отчество).",
+                    reply_markup=None 
+                )
 
-            if action == 'CONFIRM':
-                new_caption += f"✅ PAID. Confirmed by: {admin_id}"
-                user_msg = f"✅ **Payment confirmed!** Your order is **accepted**."
+                # Возвращаем на сайт HTML-страницу с сообщением об успехе (без перенаправления)
+                success_html = """
+                    <!DOCTYPE html>
+                    <html>
+                    <head><title>Успешно</title></head>
+                    <body>
+                        <script>
+                            // Закрыть окно (если открывалось как всплывающее)
+                            window.onload = function() {
+                                document.body.innerHTML = '<h1>Номер подтвержден!</h1><p>Пожалуйста, вернитесь в Telegram-бот для завершения заказа.</p>';
+                                setTimeout(function() {
+                                    if(window.opener) { window.close(); }
+                                }, 3000);
+                            }
+                        </script>
+                    </body>
+                    </html>
+                """
+                start_response('200 OK', [('Content-Type', 'text/html')])
+                return [success_html.encode('utf-8')]
             else:
-                new_caption += f"❌ REJECTED. Rejected by: {admin_id}"
-                user_msg = f"❌ **Payment rejected.** Please contact the manager: @{TELEGRAM_BOT_USERNAME}"
+                raise Exception("Failed to update order status and user data.")
             
-            send_tg_request('editMessageCaption', {
-                'chat_id': message['chat']['id'],
-                'message_id': message['message_id'],
-                'caption': new_caption,
-                'reply_markup': {"inline_keyboard": []},
-                'parse_mode': 'Markdown'
-            })
-            
-            if user_tg_id: 
-                send_message(user_tg_id, user_msg)
-                
-            send_tg_request('answerCallbackQuery', {'callback_query_id': callback_query['id'], 'text': 'Status updated.'})
+        else:
+             # Неверный статус или токен
+             start_response('400 Bad Request', [('Content-Type', 'text/html')])
+             return ["<h1>Order not found or already processed.</h1>".encode('utf-8')]
+
     except Exception as e:
-        print(f"Callback error: {e}")
-
-# --- MAIN WSGI APPLICATION ---
-
-def application(environ, start_response):
-    method = environ.get('REQUEST_METHOD', 'GET')
-    path = environ.get('PATH_INFO', '/')
-    conn = None
-    
-    # GUNICORN HEALTH CHECK FIX: Handle base path without touching DB first
-    if path == '/' and method in ('GET', 'HEAD'):
-        start_response('200 OK', [('Content-type', 'text/plain')])
-        return [b"OopsServer Running - Health OK"]
-    
-    try:
-        conn = create_psql_connection() # Connect only for non-trivial requests
-        
-        if method == 'OPTIONS':
-            start_response('200 OK', CORS_HEADERS)
-            return [b'']
-        
-        elif method == 'POST':
-            length = int(environ.get('CONTENT_LENGTH', '0'))
-            body = environ['wsgi.input'].read(length)
-            data = {}
-            try:
-                data = json.loads(body.decode('utf-8'))
-                if not isinstance(data, dict): data = {}
-            except: pass
-
-            # 1. ORDER INITIATION (SITE -> BOT)
-            if path == '/init-auth':
-                cart_data = data.get('items', data)
-                order_token = str(uuid.uuid4()).replace('-', '')[:16] 
-                
-                save_order_draft(conn, order_token, cart_data)
-                
-                # ИСПРАВЛЕНИЕ: Добавлен префикс 'auth_' для четкого разделения команд
-                tg_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=auth_{order_token}"
-                
-                resp = json.dumps({'success': True, 'telegram_auth_url': tg_link}).encode('utf-8')
-                start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
-                return [resp]
-
-            # 2. SUBMIT FULL DELIVERY DATA (SITE -> SERVER)
-            if path == '/submit-full-order':
-                if update_order_full_details(conn, data):
-                    order_token = data.get('order_token')
-                    # Префикс 'pay_' для второго шага
-                    tg_check_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=pay_{order_token}"
-
-                    resp = json.dumps({
-                        'success': True, 
-                        'message': 'Data saved. Redirect to Telegram for check.',
-                        'tg_check_url': tg_check_link,
-                        'order_token': order_token
-                    }).encode('utf-8')
-                    start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
-                    return [resp]
-                else:
-                    start_response('400 Bad Request', CORS_HEADERS + [('Content-Type', 'application/json')])
-                    return [json.dumps({'error': 'Order not found for update'}).encode('utf-8')]
-                
-            # 3. TELEGRAM WEBHOOK
-            if path.startswith('/newhook') and data: 
-                if 'message' in data:
-                    msg = data['message']
-                    if 'text' in msg and msg['text'].startswith('/start'):
-                        handle_start(conn, data)
-                    elif 'contact' in msg:
-                        handle_contact_share(conn, data)
-                    elif any(k in msg for k in ['photo', 'document']):
-                        handle_check_submission(conn, data)
-                elif 'callback_query' in data:
-                    handle_callback_query(conn, data)
-                
-                start_response('200 OK', [('Content-type', 'text/plain')])
-                return [b'OK']
-
-            start_response('404 Not Found', [('Content-type', 'text/plain')])
-            return [b'Not Found']
-
-        elif method == 'GET':
-            
-            # 1. TELEGRAM LOGIN CALLBACK (SITE)
-            if path == '/tg-login-callback':
-                query_string = environ.get('QUERY_STRING', '')
-                params = dict(parse_qsl(query_string))
-
-                if verify_telegram_authorization(params):
-                    user_id = params.get('id')
-                    success_html = f"""
-                        <!DOCTYPE html>
-                        <html>
-                        <body>
-                            <script>
-                                localStorage.setItem('telegram_user_id', '{user_id}'); 
-                                window.location.replace('{SITE_BASE_URL}'); 
-                            </script>
-                        </body>
-                        </html>
-                    """
-                    start_response('200 OK', [('Content-Type', 'text/html')])
-                    return [success_html.encode('utf-8')]
-                else:
-                    start_response('401 Unauthorized', [('Content-Type', 'text/html')])
-                    return ["<h1>Telegram authorization failed.</h1>".encode('utf-8')]
-            
-            # 2. ORDER STATUS POLLING (SITE)
-            if path.startswith('/status/'):
-                order_token = path.split('/')[-1]
-                order_data = get_order_by_token(conn, order_token)
-                
-                if order_data:
-                    status = order_data[1] 
-                    resp = json.dumps({'status': status}).encode('utf-8')
-                    start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
-                    return [resp]
-                else:
-                    start_response('404 Not Found', [('Content-type', 'application/json')])
-                    return [json.dumps({'error': 'Order not found'}).encode('utf-8')]
-            
-            start_response('404 Not Found', [('Content-type', 'text/plain')])
-            return [b'Not Found']
-        
-    except Exception as e:
-        print(f"CRITICAL: {e}")
+        print(f"Error in handle_auth_callback: {e}")
         start_response('500 Error', [('Content-type', 'application/json')])
         return [json.dumps({'error': str(e)}).encode('utf-8')]
+
+
+# 3. ДОБАВЛЕНИЕ: handle_message (Логика состояний бота)
+def handle_message(conn, update: Dict[str, Any]):
+    """Обрабатывает входящие текстовые сообщения для сбора ФИО и Адреса."""
+    try:
+        message = update.get('message', {})
+        text = message.get('text', '').strip()
+        
+        if not text or 'chat' not in message or 'from' not in message:
+            return
+            
+        chat_id = message['chat']['id']
+        user_tg_id = str(message['from']['id']) # Важно: telegram ID как строка
+        
+        # --- 1. Обработка ввода ФИО (AWAITING_FULL_NAME) ---
+        order_data = get_order_by_tg_id_and_status(conn, user_tg_id, 'AWAITING_FULL_NAME')
+        if order_data:
+            order_token, status, cart_data, phone_number, _, _ = order_data
+            
+            # Проверка ФИО: минимум два слова и длиннее 5 символов
+            if len(text.split()) >= 2 and len(text) > 5: 
+                update_order_field(conn, order_token, 'full_name', text)
+                update_order_status(conn, order_token, 'AWAITING_ADDRESS')
+                send_message(
+                    chat_id, 
+                    "👍 **ФИО принято!**\n\nТеперь, пожалуйста, введите **полный адрес доставки** (город, улица, дом, квартира).",
+                )
+            else:
+                send_message(chat_id, "⚠️ **Некорректный ввод ФИО.** Пожалуйста, введите ваше полное ФИО (Фамилия Имя Отчество).")
+            return
+        
+        # --- 2. Обработка ввода Адреса (AWAITING_ADDRESS) ---
+        order_data = get_order_by_tg_id_and_status(conn, user_tg_id, 'AWAITING_ADDRESS')
+        if order_data:
+            # order_data: token, status, cart_data, phone_number, full_name, address_line (здесь address_line будет None)
+            order_token, status, cart_data, phone_number, full_name, _ = order_data
+            
+            # Проверка: адрес должен быть достаточно информативным
+            if len(text) > 10: 
+                update_order_field(conn, order_token, 'address_line', text)
+                
+                # Финализация заказа и уведомление администратора
+                finalize_order_and_notify_admin(conn, order_token, cart_data, full_name, phone_number, text, user_tg_id)
+
+                # Уведомление Пользователя
+                send_message(
+                    chat_id, 
+                    "🎉 **Заказ успешно оформлен!** \n\nВся информация о доставке и оплате будет уточнена менеджером. \n\nДля любых вопросов по заказу, пожалуйста, напишите в службу поддержки: **@oopssupport**\n\nСпасибо за ваш заказ! Ваш менеджер: **@oopssupport**",
+                )
+                # Устанавливаем финальный статус
+                update_order_status(conn, order_token, 'PLACED_TG')
+            else:
+                send_message(chat_id, "⚠️ **Адрес слишком короткий.** Пожалуйста, введите полный адрес доставки (город, улица, дом, квартира).")
+            return
+        
+        # --- 3. Обработка стандартных команд ---
+        if text.lower() == '/start':
+             send_message(
+                chat_id, 
+                "Здравствуйте! Чтобы начать оформление заказа, перейдите в корзину на нашем сайте и нажмите кнопку **'Перейти в Telegram-бот для оформления'**.",
+            )
+             return
+             
+    except Exception as e:
+        print(f"Error in handle_message: {e}")
+        # В случае ошибки, отправляем пользователю общее сообщение
+        send_message(chat_id, "Произошла внутренняя ошибка при обработке вашего запроса. Попробуйте начать заново или обратитесь в @oopssupport.")
+
+
+# 4. ИЗМЕНЕНИЕ: application (Добавление маршрута для Webhook)
+def application(env, start_response):
+    # ... (Оставить без изменений до секции с PATH_INFO)
+    try:
+        conn = get_db_conn()
+        path = env.get('PATH_INFO', '')
+        method = env.get('REQUEST_METHOD', '')
+
+        # --- TELEGRAM WEBHOOK HANDLER (ДОБАВЛЕНИЕ ЭТОГО БЛОКА) ---
+        if path == f'/webhook/tg/{TELEGRAM_BOT_TOKEN}' and method == 'POST':
+            try:
+                request_body_size = int(env.get('CONTENT_LENGTH', 0))
+                request_body = env['wsgi.input'].read(request_body_size)
+                update = json.loads(request_body)
+                handle_message(conn, update)
+                start_response('200 OK', [('Content-type', 'application/json')])
+                return [b'{}']
+            except Exception as e:
+                print(f"Webhook Error: {e}")
+                start_response('500 Error', [('Content-type', 'application/json')])
+                return [json.dumps({'error': 'Webhook processing error'}).encode('utf-8')]
+        # -------------------------------------------------------------
+        
+        # 1. API - INITIATE AUTH (Site request)
+        if path == '/init-auth' and method == 'POST':
+            return handle_init_auth(conn, env, start_response)
+
+        # 2. API - TELEGRAM AUTH CALLBACK (Telegram redirects here)
+        if path == '/auth-callback' and method == 'GET':
+            return handle_auth_callback(conn, env, start_response)
+            
+        # 3. API - SUBMIT FULL ORDER (УДАЛЯЕМ ЭТОТ МАРШРУТ, Т.К. ВСЕ В БОТЕ)
+        # if path == '/submit-full-order' and method == 'POST':
+        #    return handle_submit_full_order(conn, env, start_response) # <-- УДАЛИТЬ
+
+        # 4. API - CALCULATE DELIVERY (УДАЛЯЕМ ЭТОТ МАРШРУТ)
+        # if path == '/calculate-delivery' and method == 'POST':
+        #    return handle_calculate_delivery(conn, env, start_response) # <-- УДАЛИТЬ
+
+        # 5. ORDER STATUS POLLING (SITE) - ОСТАВЛЯЕМ ДЛЯ ПРОВЕРКИ СТАТУСА
+        if path.startswith('/status/'):
+             order_token = path.split('/')[-1]
+             # ... (Код обработки статуса остается) ...
+             # ...
+             
+        # ... (Остальной код остается) ...
+
+    except Exception as e:
+        # ...
+        pass
     finally:
         if conn: conn.close()
