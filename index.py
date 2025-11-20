@@ -5,7 +5,7 @@ import psycopg2
 import psycopg2.errors
 import requests 
 from typing import Dict, Any
-import re # Добавлен для очистки токена
+import re 
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -78,8 +78,8 @@ def init_db(conn):
             """)
             
             # --- РОБУСТНОЕ ИСПРАВЛЕНИЕ ОШИБКИ ДАТЫ (АВТОМАТИЧЕСКАЯ МИГРАЦИЯ) ---
+            # Повторяем попытку автоматической миграции, чтобы помочь тем, кто не может вручную
             try:
-                # 1. Проверяем текущий тип колонки
                 cur.execute(f"""
                     SELECT data_type 
                     FROM information_schema.columns 
@@ -87,20 +87,19 @@ def init_db(conn):
                 """)
                 result = cur.fetchone()
                 
-                # 2. Если тип не 'text' или 'character varying' (т.е. 'timestamp with time zone'), то меняем его
                 if result and result[0] not in ('text', 'character varying'):
                     print(f"MIGRATION: Column admin_delivery_date is currently {result[0]}. Altering to TEXT.")
-                    # Используем USING для принудительной конвертации (превращаем старые данные в текст)
+                    # Принудительная конвертация, игнорируя ошибки старых данных
                     cur.execute(f"""
                         ALTER TABLE {ORDERS_TABLE_NAME} 
                         ALTER COLUMN admin_delivery_date TYPE TEXT USING admin_delivery_date::TEXT;
                     """)
                     print("MIGRATION: admin_delivery_date successfully altered to TEXT.")
             except psycopg2.errors.UndefinedTable:
-                # Таблица orders еще не создана, пропускаем
                 pass
             except Exception as e:
                 print(f"MIGRATION ERROR (admin_delivery_date type fix): {e}")
+
 
             # Добавление недостающих колонок, если они не существуют
             def add_column_if_not_exists(col_name, col_type):
@@ -396,14 +395,13 @@ def handle_telegram_update(conn, update):
             order_token, track_number, pvz_address, delivery_date_str = parts
             
             # --- УСИЛЕННАЯ ОЧИСТКА ТОКЕНА (для удаления префикса 'OOPS SUPPORT [24/7]: ') ---
-            if len(order_token) > 12:
-                # Ищем 12-значную последовательность букв и цифр (стандартный токен)
-                match = re.search(r'([0-9a-fA-F]{12})', order_token)
-                if match:
-                    order_token = match.group(1)
-                else:
-                    # Резервный вариант: если токен не найден, берем последнюю часть
-                    order_token = order_token.split(':')[-1].strip().split(' ')[-1].strip()
+            # Ищем 12-значную последовательность букв и цифр (стандартный токен)
+            match = re.search(r'([0-9a-fA-F]{12})', order_token)
+            if match:
+                order_token = match.group(1)
+            else:
+                # Резервный вариант: если токен не найден, берем последнюю часть
+                order_token = order_token.split(':')[-1].strip().split(' ')[-1].strip()
 
             # Ищем заказ по токену
             order_to_update = get_order_by_token(conn, order_token) 
@@ -513,7 +511,7 @@ def application(environ, start_response):
     conn = None
     try:
         conn = create_psql_connection()
-        init_db(conn) # Вызываем миграцию при каждом обращении к серверу
+        init_db(conn) 
         if method == 'OPTIONS':
             start_response('200 OK', CORS_HEADERS)
             return [b'']
