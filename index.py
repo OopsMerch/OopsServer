@@ -15,7 +15,6 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
-# Убедитесь, что все эти переменные установлены в Render
 TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
 
@@ -132,7 +131,7 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         cursor.execute(query, params)
         return cursor.rowcount > 0
 
-# ИСПРАВЛЕНИЕ: Добавлен 'user_tg_id' в SELECT запрос для корректной отправки админу
+# ВКЛЮЧАЕТ 'user_tg_id' В SELECT
 def get_order_by_tg_id(conn, user_tg_id):
     query = f"""
     SELECT 
@@ -190,17 +189,14 @@ def send_message(chat_id, text, reply_markup=None):
         print(f"Error sending message to {chat_id}: {e}")
 
 def generate_admin_order_message(order_data):
-    # ИСПРАВЛЕНИЕ: Безопасное чтение JSONB из базы данных
     cart_data_raw = order_data['cart_data']
     if isinstance(cart_data_raw, str):
         cart_items = json.loads(cart_data_raw)
     else:
         cart_items = cart_data_raw
 
-    # Форматирование списка товаров
     items_list = "\n".join([f"- {item['quantity']} шт. | {item['name']} (Размер: {item['size']}, {item.get('price', 'N/A')} ₽/шт.)" for item in cart_items])
     
-    # Кнопка для администратора
     inline_keyboard = {
         "inline_keyboard": [
             [
@@ -218,7 +214,7 @@ def generate_admin_order_message(order_data):
 **Пользовательские данные:**
 👤 ФИО: {order_data['full_name']}
 📱 Телефон: {order_data['phone_number']}
-📧 TG ID: `{order_data['user_tg_id']}`
+📧 TG ID: `{order_data['user_tg_id']}` # <-- ДОСТУП К ПОЛЮ ИСПРАВЛЕН
 
 ---
 **Доставка:**
@@ -488,6 +484,7 @@ def handle_telegram_update(conn, update):
             if 'photo' in message or 'document' in message or text:
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
                  
+                 # Повторная выборка для получения всех данных, включая обновленный статус
                  order_data_full = get_order_by_tg_id(conn, str(chat_id))
                  if order_data_full:
                     send_admin_order_notification(order_data_full)
@@ -499,7 +496,6 @@ def handle_telegram_update(conn, update):
         
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
-        # Проверяем, что сообщение пришло именно из группы администратора
         if str(chat_id) == TG_ADMIN_GROUP_ID:
             
             try:
