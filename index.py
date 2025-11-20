@@ -15,7 +15,8 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
-TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов (например, -100...)
+# Убедитесь, что все эти переменные установлены в Render
+TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
 
 # ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
@@ -89,7 +90,7 @@ def init_db(conn):
             add_column_if_not_exists('delivery_type', 'VARCHAR(50) DEFAULT NULL')
             add_column_if_not_exists('delivery_address_data', 'TEXT DEFAULT NULL')
             add_column_if_not_exists('admin_track_number', 'VARCHAR(50) DEFAULT NULL')
-            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL') # Changed to TEXT for simplicity
+            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL')
             
     except Exception as e:
         print(f"Database initialization error: {e}")
@@ -131,7 +132,7 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         cursor.execute(query, params)
         return cursor.rowcount > 0
 
-# ИСПРАВЛЕНИЕ: Добавлен 'user_tg_id' в SELECT запрос
+# ИСПРАВЛЕНИЕ: Добавлен 'user_tg_id' в SELECT запрос для корректной отправки админу
 def get_order_by_tg_id(conn, user_tg_id):
     query = f"""
     SELECT 
@@ -189,15 +190,14 @@ def send_message(chat_id, text, reply_markup=None):
         print(f"Error sending message to {chat_id}: {e}")
 
 def generate_admin_order_message(order_data):
-    # ИСПРАВЛЕНИЕ #2: Проверка, нужно ли декодировать cart_data
+    # ИСПРАВЛЕНИЕ: Безопасное чтение JSONB из базы данных
     cart_data_raw = order_data['cart_data']
     if isinstance(cart_data_raw, str):
         cart_items = json.loads(cart_data_raw)
     else:
-        # Если это уже dict/list (как возвращает psycopg2 для JSONB), используем напрямую
         cart_items = cart_data_raw
 
-    # Исправлена логика форматирования для получения цены из элемента корзины (если она есть)
+    # Форматирование списка товаров
     items_list = "\n".join([f"- {item['quantity']} шт. | {item['name']} (Размер: {item['size']}, {item.get('price', 'N/A')} ₽/шт.)" for item in cart_items])
     
     # Кнопка для администратора
@@ -279,25 +279,10 @@ def send_payment_details(chat_id, order_data):
     remove_keyboard = {"remove_keyboard": True}
     send_message(chat_id, message, reply_markup=remove_keyboard)
     
-def generate_order_summary_list(order_data):
-    # Исправление для чтения JSONB
-    cart_data_raw = order_data.get('cart_data', '[]')
-    if isinstance(cart_data_raw, str):
-        cart_items = json.loads(cart_data_raw)
-    else:
-        cart_items = cart_data_raw
-
-    items_list = "\n".join([
-        f"{item['quantity']} шт. | {item['name']} (Размер: {item['size']})" 
-        for item in cart_items
-    ])
-    return items_list
-
 # --- TELEGRAM BOT LOGIC (Handle Updates) ---
 
 def handle_telegram_update(conn, update):
     
-    # 1. ОБРАБОТКА CALLBACK_QUERY (Кнопки в чате админа И пользователя)
     if 'callback_query' in update:
         query = update['callback_query']
         chat_id = query['message']['chat']['id']
@@ -309,12 +294,7 @@ def handle_telegram_update(conn, update):
             order_token = data.replace('admin_process_', '')
             order_data = get_order_by_token(conn, order_token)
             
-            # ! Проверка: Убедитесь, что это администратор, если ID группы совпадает !
-            
-            # Мы проверяем статус AWAITING_ADMIN, так как кнопка должна быть нажата после оплаты
             if order_data and order_data['status'] == STATUS_AWAITING_ADMIN: 
-                 # Меняем статус и запрашиваем ввод данных от админа
-                 # Не меняем статус, так как он уже AWAITING_ADMIN, просто отправляем запрос
                  
                  response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
                  
@@ -325,23 +305,19 @@ def handle_telegram_update(conn, update):
                     'message_id': message_id,
                     'text': query['message']['text'] + '\n\n**Статус:** 🔄 Ожидает ввода данных от администратора',
                     'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps({"inline_keyboard": []}) # Убираем кнопку
+                    'reply_markup': json.dumps({"inline_keyboard": []})
                  })
                  
-                 # Отправляем отдельное сообщение с запросом ввода
                  send_message(chat_id, response_text, reply_markup=None)
             
-            return # Выходим после обработки админской кнопки
+            return
         
-        # --- ПОЛЬЗОВАТЕЛЬСКАЯ ЛОГИКА (Если это не админская кнопка) ---
-        
-        # Получаем контекст заказа
+        # --- ПОЛЬЗОВАТЕЛЬСКАЯ ЛОГИКА ---
         order = get_order_by_tg_id(conn, str(chat_id))
         
         if order and order['status'] in [STATUS_PENDING_DELIVERY_TYPE, STATUS_PENDING_CONFIRMATION]:
             order_token = order['order_token']
             
-            # --- Выбор способа доставки ---
             delivery_type = None
             delivery_info = ""
             
@@ -352,9 +328,7 @@ def handle_telegram_update(conn, update):
                 delivery_type = 'Почта России'
                 delivery_info = f"Для **Почты России** будет использован полный адрес для доставки до почтового отделения: *{order['address']}*."
             
-            # Переход к подтверждению
             if delivery_type:
-                # Обновляем заказ, переходим к подтверждению
                 update_order(conn, order_token=order_token, delivery_type=delivery_type, delivery_address_data=order['address'], status=STATUS_PENDING_CONFIRMATION)
                 
                 confirmation_message = f"""
@@ -378,7 +352,6 @@ def handle_telegram_update(conn, update):
                     ]
                 }
                 
-                # Редактируем сообщение, чтобы избежать спама
                 edit_message_url = TG_API_BASE + 'editMessageText'
                 requests.post(edit_message_url, json={
                     'chat_id': chat_id,
@@ -388,29 +361,24 @@ def handle_telegram_update(conn, update):
                     'reply_markup': json.dumps(keyboard)
                 })
                 
-                return # Выходим после обработки выбора доставки
+                return
             
-            # --- Подтверждение/Сброс ---
             elif data == 'confirm_order' and order['status'] == STATUS_PENDING_CONFIRMATION:
-                # Обновляем статус на ожидание оплаты
                 update_order(conn, order_token=order_token, status=STATUS_PENDING_PAYMENT)
                 
-                # Отправляем реквизиты
                 send_payment_details(chat_id, order)
                 
-                # Редактируем сообщение для фиксации выбора
                 edit_message_url = TG_API_BASE + 'editMessageText'
                 requests.post(edit_message_url, json={
                     'chat_id': chat_id,
                     'message_id': query['message']['message_id'],
                     'text': query['message']['text'] + '\n\n**Статус:** ✅ **Подтверждено.** Ожидаем оплаты.',
                     'parse_mode': 'Markdown',
-                    'reply_markup': json.dumps({"inline_keyboard": []}) # Убираем кнопку
+                    'reply_markup': json.dumps({"inline_keyboard": []})
                 })
-                return # Выходим после подтверждения
+                return
             
             elif data == 'start_over':
-                # Сбрасываем заказ в начальный статус (ожидание ФИО)
                 update_order(
                     conn, 
                     order_token=order_token, 
@@ -421,7 +389,6 @@ def handle_telegram_update(conn, update):
                 )
                 
                 send_message(chat_id, "🔄 **Начинаем заново.** Введите ваше **ФИО** (Полностью):")
-                # Редактируем сообщение для фиксации сброса
                 edit_message_url = TG_API_BASE + 'editMessageText'
                 requests.post(edit_message_url, json={
                     'chat_id': chat_id,
@@ -430,9 +397,8 @@ def handle_telegram_update(conn, update):
                     'parse_mode': 'Markdown',
                     'reply_markup': json.dumps({"inline_keyboard": []})
                 })
-                return # Выходим после сброса
+                return
 
-        # Если это callback_query, но не для текущего активного заказа, просто выходим
         return
         
     if 'message' not in update: return
@@ -441,7 +407,6 @@ def handle_telegram_update(conn, update):
     chat_id = message['chat']['id']
     text = message.get('text', '')
     
-    # Получаем или создаем контекст/состояние заказа
     order = get_order_by_tg_id(conn, str(chat_id))
     
     # 1. ОБРАБОТКА КОНТАКТА
@@ -519,12 +484,10 @@ def handle_telegram_update(conn, update):
 
         # --- 3.4 ОЖИДАНИЕ ФАЙЛА (ЧЕКА) ---
         elif current_status == STATUS_PENDING_PAYMENT:
-            # Если прислали фотографию, документ или просто текст - считаем, что это подтверждение оплаты.
+            # Принимаем любой файл (photo, document) или текст как подтверждение
             if 'photo' in message or 'document' in message or text:
-                 # Меняем статус на ожидание админа
                  update_order(conn, order_token=order_token, status=STATUS_AWAITING_ADMIN)
                  
-                 # Отправляем уведомление администратору
                  order_data_full = get_order_by_tg_id(conn, str(chat_id))
                  if order_data_full:
                     send_admin_order_notification(order_data_full)
@@ -536,6 +499,7 @@ def handle_telegram_update(conn, update):
         
         global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
         
+        # Проверяем, что сообщение пришло именно из группы администратора
         if str(chat_id) == TG_ADMIN_GROUP_ID:
             
             try:
@@ -546,10 +510,9 @@ def handle_telegram_update(conn, update):
                      
                 track_number, pvz_address, delivery_date_str = parts
 
-                # Ищем самый последний заказ в статусе AWAITING_ADMIN
+                # Ищем последний активный заказ в ожидании админа
                 order_to_update = None
                 with conn.cursor() as cur:
-                     # Добавляем user_tg_id и full_name для отправки уведомления клиенту
                      cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
                      row = cur.fetchone()
                      if row:
@@ -557,17 +520,15 @@ def handle_telegram_update(conn, update):
                          order_to_update = dict(zip(columns, row))
 
                 if order_to_update:
-                    # Обновляем заказ
                     update_order(
                         conn, 
                         order_token=order_to_update['order_token'], 
                         admin_track_number=track_number, 
-                        delivery_address_data=pvz_address, # Переписываем адрес на ПВЗ
+                        delivery_address_data=pvz_address,
                         admin_delivery_date=delivery_date_str, 
                         status=STATUS_COMPLETED
                     )
 
-                    # Отправляем сообщение пользователю
                     client_message = f"""
 ✅ **Ваш заказ оформлен!** (Токен: `{order_to_update['order_token']}`)
 
@@ -582,7 +543,6 @@ def handle_telegram_update(conn, update):
 ---
 🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
 """
-                    # Теперь order_to_update['user_tg_id'] гарантированно есть
                     send_message(int(order_to_update['user_tg_id']), client_message)
                     
                     send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_to_update['order_token']})")
@@ -595,7 +555,6 @@ def handle_telegram_update(conn, update):
 
             except Exception as e:
                 print(f"Admin input parsing error: {e}")
-                # Если не удалось распарсить, напоминаем формат
                 send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
                 return
 
