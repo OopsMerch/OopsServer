@@ -9,13 +9,15 @@ import hashlib
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
+# Переменные окружения будут автоматически загружены здесь
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
 # !!! ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ДЛЯ БИЗНЕС-ЛОГИКИ !!!
-TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID')
-ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
+# Убедитесь, что все эти переменные установлены в Render
+TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID') # ID группы для заказов
+ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport') # Имя саппорта
 
 # ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
 SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
@@ -25,7 +27,7 @@ ALFABANK_CARD = os.environ.get('ALFABANK_CARD', 'ZZZZ ZZZZ ZZZZ ZZZZ')
 ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
 
-# CORS заголовки
+# CORS заголовки (разрешают запросы с вашего сайта)
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
     ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), 
@@ -131,9 +133,9 @@ def update_order(conn, order_token=None, user_tg_id=None, **kwargs):
         return cursor.rowcount > 0
 
 def get_order_by_tg_id(conn, user_tg_id):
-    # --- НОВЫЕ ОТЛАДОЧНЫЕ СООБЩЕНИЯ ---
+    # --- ОТЛАДКА ---
     print(f"DEBUG: Searching for active order for TG ID: {user_tg_id}") 
-    # -----------------------------------
+    # ----------------
     
     query = f"""
     SELECT 
@@ -153,14 +155,14 @@ def get_order_by_tg_id(conn, user_tg_id):
         if row:
             columns = [desc[0] for desc in cursor.description]
             result = dict(zip(columns, row))
-            # --- НОВЫЕ ОТЛАДОЧНЫЕ СООБЩЕНИЯ ---
+            # --- ОТЛАДКА ---
             print(f"DEBUG: Order found (Token: {result['order_token']}, Status: {result['status']})")
-            # -----------------------------------
+            # ----------------
             return result
         
-        # --- НОВЫЕ ОТЛАДОЧНЫЕ СООБЩЕНИЯ ---
+        # --- ОТЛАДКА ---
         print(f"DEBUG: No active order found for TG ID: {user_tg_id}") 
-        # -----------------------------------
+        # ----------------
         return None
         
 def get_order_by_token(conn, order_token):
@@ -418,7 +420,6 @@ def handle_telegram_update(conn, update):
     order = get_order_by_tg_id(conn, str(chat_id))
     
     # 1. ОБРАБОТКА КОНТАКТА
-    # --- Логика будет работать, только если order не None и статус PENDING_AUTH ---
     if 'contact' in message and order and order['status'] == STATUS_PENDING_AUTH:
         
         phone = message['contact']['phone_number']
@@ -426,13 +427,17 @@ def handle_telegram_update(conn, update):
         # Попытка обновления данных и проверка успеха
         if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
             
+            # --- ОТЛАДКА ---
             print(f"DEBUG: Order {order['order_token']} updated successfully with phone {phone}. Sending next prompt.") 
+            # ----------------
             
             remove_keyboard = {"remove_keyboard": True}
             send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
         else:
             
+            # --- ОТЛАДКА ---
             print(f"DEBUG: Order update FAILED for {order['order_token']} in PENDING_AUTH.") 
+            # ----------------
             
             send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
         
@@ -444,7 +449,13 @@ def handle_telegram_update(conn, update):
         if len(params) > 1 and params[1].startswith('auth_'):
             order_token = params[1].replace('auth_', '')
             
-            if update_order(conn, order_token=order_token, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH):
+            # --- ОТЛАДКА: Проверяем, удалось ли записать user_tg_id ---
+            update_success = update_order(conn, order_token=order_token, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH)
+            
+            print(f"DEBUG: START command received. Token: {order_token}. Update success: {update_success}") 
+            # --------------------------------------------------------
+
+            if update_success:
                 keyboard = {
                     "keyboard": [[{"text": "📱 Отправить номер телефона", "request_contact": True}]],
                     "one_time_keyboard": True,
