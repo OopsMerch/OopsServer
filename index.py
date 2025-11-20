@@ -2,7 +2,7 @@ import os
 import json
 import uuid
 import psycopg2 
-import psycopg2.errors # Для обработки ошибок в init_db
+import psycopg2.errors # <-- ДОБАВЛЕНО для обработки ошибок ALTER TABLE
 import requests 
 import re 
 import hmac
@@ -25,9 +25,28 @@ CORS_HEADERS = [
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
+# --- TELEGRAM AUTH FUNCTION ---
+
+def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
+    if not auth_data or 'hash' not in auth_data or not TELEGRAM_BOT_TOKEN:
+        return False
+    data_list = []
+    for key, value in auth_data.items():
+        if key != 'hash':
+            data_list.append(f"{key}={value}")
+    data_list.sort()
+    data_check_string = '\n'.join(data_list)
+    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode('utf-8')).digest()
+    calculated_hash = hmac.new(
+        secret_key,
+        data_check_string.encode('utf-8'),
+        hashlib.sha256
+    ).hexdigest()
+    return calculated_hash == auth_data['hash']
+
 # --- DATABASE FUNCTIONS ---
 
-# НОВАЯ/ИСПРАВЛЕННАЯ ФУНКЦИЯ: Создает таблицу со всеми нужными столбцами
+# ИСПРАВЛЕНО: удалены все Python-комментарии из SQL-строки
 def init_db(conn):
     try:
         with conn.cursor() as cur:
@@ -38,14 +57,12 @@ def init_db(conn):
                     status VARCHAR(50) NOT NULL,
                     cart_data JSONB NOT NULL,
                     
-                    # НОВЫЙ СТОЛБЕЦ, КОТОРЫЙ ВЫЗЫВАЛ ОШИБКУ 500
                     total_amount NUMERIC(10, 2) NOT NULL DEFAULT 0.00, 
                     
                     user_tg_id VARCHAR(50) DEFAULT NULL,
                     phone_number VARCHAR(20) DEFAULT NULL,
                     check_file_id TEXT DEFAULT NULL,
 
-                    # Дополнительные поля для full_details:
                     full_name VARCHAR(255) DEFAULT NULL,
                     email VARCHAR(255) DEFAULT NULL,
                     delivery_type VARCHAR(50) DEFAULT NULL,
@@ -62,10 +79,6 @@ def init_db(conn):
             """)
             
             # --- АВТОМАТИЧЕСКОЕ ДОБАВЛЕНИЕ СТОЛБЦОВ К СУЩЕСТВУЮЩЕЙ ТАБЛИЦЕ ---
-            # Это нужно, если таблица 'orders' уже была создана без этих полей.
-            # Если вы видите эту ошибку снова, возможно, нужно удалить старую таблицу.
-            
-            # Список всех столбцов, которые должны быть
             required_columns = {
                 'total_amount': 'NUMERIC(10, 2) NOT NULL DEFAULT 0.00',
                 'phone_number': 'VARCHAR(20) DEFAULT NULL',
@@ -92,6 +105,10 @@ def init_db(conn):
                 except psycopg2.errors.DuplicateColumn:
                     conn.rollback() 
                 except Exception as e:
+                    # Пропускаем ошибки, если таблица еще не существует (должна быть создана выше)
+                    if "relation" in str(e) and "does not exist" in str(e):
+                        conn.rollback()
+                        continue
                     print(f"Failed to add column {column}: {e}")
                     conn.rollback()
             # -------------------------------------------------------------
@@ -100,8 +117,7 @@ def init_db(conn):
             print("Database initialized/checked successfully.")
     except Exception as e:
         print(f"Database initialization error: {e}")
-        # НЕ ВЫЗЫВАЙТЕ sys.exit() ЗДЕСЬ, чтобы Render мог показать логи
-        
+
 def create_psql_connection():
     if not DATABASE_URL:
         raise ValueError("DATABASE_URL is not set.")
@@ -110,15 +126,14 @@ def create_psql_connection():
     init_db(conn) # Вызываем проверку/создание таблицы при подключении
     return conn
 
-# ИСПРАВЛЕННАЯ ФУНКЦИЯ: Теперь принимает total_amount и вставляет его
+# ИСПРАВЛЕНО: Функция теперь принимает total_amount
 def save_order_draft(conn, order_token, cart_data, total_amount):
     cursor = conn.cursor()
-    # ДОБАВЛЕНО: total_amount в запрос INSERT и в параметры
+    # ДОБАВЛЕНО: total_amount в запрос INSERT
     query = f"""
     INSERT INTO {ORDERS_TABLE_NAME} (order_token, status, cart_data, total_amount)
     VALUES (%s, %s, %s, %s);
     """
-    # Теперь передаем total_amount
     cursor.execute(query, (order_token, "pending_phone_auth", json.dumps(cart_data), total_amount))
     cursor.close()
 
@@ -186,7 +201,6 @@ def update_order_full_details(conn, data):
     return cursor.rowcount > 0
 
 def get_order_by_tg_id(conn, user_tg_id):
-    # Добавил phone_number в SELECT
     cursor = conn.cursor()
     query = f"""
     SELECT order_token, status, cart_data, phone_number, user_tg_id, check_file_id
@@ -200,7 +214,6 @@ def get_order_by_tg_id(conn, user_tg_id):
     return result
 
 def get_order_by_token(conn, order_token):
-    # Убедился, что все поля, используемые в handle_check_submission, присутствуют
     cursor = conn.cursor()
     query = f"""
     SELECT 
@@ -214,25 +227,6 @@ def get_order_by_token(conn, order_token):
     result = cursor.fetchone()
     cursor.close()
     return result
-
-# --- TELEGRAM AUTH FUNCTION ---
-
-def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
-    if not auth_data or 'hash' not in auth_data or not TELEGRAM_BOT_TOKEN:
-        return False
-    data_list = []
-    for key, value in auth_data.items():
-        if key != 'hash':
-            data_list.append(f"{key}={value}")
-    data_list.sort()
-    data_check_string = '\n'.join(data_list)
-    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode('utf-8')).digest()
-    calculated_hash = hmac.new(
-        secret_key,
-        data_check_string.encode('utf-8'),
-        hashlib.sha256
-    ).hexdigest()
-    return calculated_hash == auth_data['hash']
 
 # --- TELEGRAM HELPERS ---
 
@@ -300,7 +294,8 @@ def handle_pay_start(conn, chat_id, user_tg_id, order_token):
     # order_data[4] - user_tg_id
     order_data = get_order_by_token(conn, order_token) 
     
-    if order_data and order_data[4] == str(user_tg_id): 
+    # user_tg_id из get_order_by_token приходит как int/str (в зависимости от базы), сравниваем с int user_tg_id из update
+    if order_data and str(order_data[4]) == str(user_tg_id): 
         update_order_status_and_user(conn, order_token, 'pending_check_submission') 
         
         send_message(
@@ -362,16 +357,18 @@ def handle_check_submission(conn, update):
         
         if file_id:
             update_order_status_and_user(conn, order_token, 'awaiting_admin_confirm', check_file_id=file_id)
-            # order_data[15] - total_amount
-            # order_data[12] - payment_amount
+            
+            # Теперь get_order_by_token возвращает total_amount (индекс 15)
             full_order_data = get_order_by_token(conn, order_token)
             
             try:
+                # Извлекаем данные
                 raw_cart = json.loads(full_order_data[2])
                 items_text = ""
                 
                 # Используем total_amount (индекс 15) для отображения полной суммы заказа
                 total_order_amount = full_order_data[15] if full_order_data[15] is not None else 0
+                # payment_amount (индекс 12)
                 payment_amount = full_order_data[12] if full_order_data[12] is not None else total_order_amount
 
                 if isinstance(raw_cart, dict) and 'items' in raw_cart and isinstance(raw_cart['items'], list):
@@ -488,7 +485,6 @@ def application(environ, start_response):
     path = environ.get('PATH_INFO', '/')
     conn = None
     
-    # GUNICORN HEALTH CHECK FIX: Handle base path without touching DB first
     if path == '/' and method in ('GET', 'HEAD'):
         start_response('200 OK', [('Content-type', 'text/plain')])
         return [b"OopsServer Running - Health OK"]
@@ -511,7 +507,7 @@ def application(environ, start_response):
 
             # 1. ORDER INITIATION (SITE -> BOT)
             if path == '/init-auth':
-                # ИСПРАВЛЕННЫЙ БЛОК: Извлекаем items И total_amount
+                # ИСПРАВЛЕНО: Теперь ищем items И total_amount
                 items = data.get('items')
                 total_amount = data.get('total_amount')
                 
@@ -528,7 +524,6 @@ def application(environ, start_response):
                 
                 tg_link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=auth_{order_token}"
                 
-                # Возвращаем новую ссылку, которая перенаправит в бот
                 resp = json.dumps({'success': True, 'telegram_bot_url': tg_link}).encode('utf-8')
                 start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
                 return [resp]
