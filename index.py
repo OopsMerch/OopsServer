@@ -1,317 +1,330 @@
 import os
 import json
 import uuid
-import psycopg2 
-import requests 
-import re 
-import hmac
-import hashlib 
-from urllib.parse import parse_qsl 
-from typing import Dict, Any
+import re
+import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 
 # --- CONFIGURATION ---
-# Используйте переменные окружения, установленные на Render
+# Получаем переменные окружения
 DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID') 
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot')
 SITE_BASE_URL = os.environ.get('SITE_BASE_URL', 'https://oops-merch.ru') 
 
-ORDERS_TABLE_NAME = 'orders'
 TG_API_BASE = f'https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/'
+
+# CORS заголовки для ответов сайту
 CORS_HEADERS = [
     ('Access-Control-Allow-Origin', '*'), 
     ('Access-Control-Allow-Methods', 'POST, GET, OPTIONS'), 
     ('Access-Control-Allow-Headers', 'Content-Type')
 ]
 
-# --- TELEGRAM API UTILITIES (Примерная реализация) ---
-def send_message(chat_id: int, text: str, reply_markup=None, parse_mode='Markdown'):
+# --- DATABASE UTILS ---
+
+def get_db_connection():
+    """Создает подключение к PostgreSQL."""
+    if not DATABASE_URL:
+        raise Exception("DATABASE_URL не установлена в Environment Variables.")
+    
+    # Исправление для Render: psycopg2 требует 'postgresql://', а Render иногда дает 'postgres://'
+    conn_url = DATABASE_URL.replace("postgres://", "postgresql://")
+    return psycopg2.connect(conn_url, cursor_factory=RealDictCursor)
+
+def init_db():
+    """Создает таблицу orders, если она не существует."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS orders (
+                    order_token VARCHAR(50) PRIMARY KEY,
+                    status VARCHAR(50) NOT NULL,
+                    cart_data JSONB,
+                    total_amount NUMERIC(10, 2),
+                    
+                    user_tg_id BIGINT,
+                    phone_number VARCHAR(30),
+                    full_name TEXT,
+                    address TEXT,
+                    
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+        conn.commit()
+        print("Database initialized/checked successfully.")
+    except Exception as e:
+        print(f"DB Init Error: {e}")
+    finally:
+        conn.close()
+
+# Запускаем инициализацию таблицы при старте скрипта (один раз)
+init_db()
+
+
+# --- TELEGRAM API UTILITIES ---
+
+def send_message(chat_id, text, reply_markup=None):
+    """Отправляет сообщение в Telegram."""
     payload = {
         'chat_id': chat_id,
         'text': text,
-        'parse_mode': parse_mode
+        'parse_mode': 'Markdown'
     }
     if reply_markup:
         payload['reply_markup'] = json.dumps(reply_markup)
         
     try:
-        requests.post(TG_API_BASE + 'sendMessage', data=payload)
+        requests.post(TG_API_BASE + 'sendMessage', json=payload)
     except Exception as e:
-        print(f"Error sending Telegram message: {e}")
+        print(f"Telegram Send Error: {e}")
 
-# Функции verify_telegram_authorization и send_admin_notification (оставлены как заглушки)
-def verify_telegram_authorization(auth_data: Dict[str, str]) -> bool:
-    # ... (Логика проверки hash)
-    return True
-
-def send_admin_notification(order_token: str, subject: str):
+def send_admin_notification(order_token, text):
+    """Отправляет уведомление админу."""
     if ADMIN_CHAT_ID:
-        message = f"**Новое событие по заказу {order_token}:**\n{subject}"
-        send_message(ADMIN_CHAT_ID, message)
+        msg = f"🔔 **Заказ #{order_token}**\n{text}"
+        send_message(ADMIN_CHAT_ID, msg)
 
-# --- DATABASE STUBS (ОБЯЗАТЕЛЬНО К РЕАЛИЗАЦИИ) ---
-def get_db_connection():
-    """Возвращает соединение с базой данных."""
-    if not DATABASE_URL:
-        raise Exception("DATABASE_URL environment variable is not set.")
-    return psycopg2.connect(DATABASE_URL)
 
-def save_order_draft(conn, items: list, total_amount: float) -> str:
-    """СОХРАНЯЕТ черновик заказа со статусом 'pending_phone' и возвращает order_token."""
-    order_token = str(uuid.uuid4())[:8] 
+# --- REAL DATABASE LOGIC ---
+
+def save_order_draft(conn, items, total_amount):
+    """Сохраняет новый заказ из корзины."""
+    order_token = uuid.uuid4().hex[:8] # Генерируем короткий токен
     items_json = json.dumps(items)
-    status = 'pending_phone'
     
-    # !!! Здесь должна быть РЕАЛЬНАЯ ЛОГИКА вставки в базу данных !!!
-    print(f"STUB: Saving order draft {order_token} with status {status}")
-    # Пример SQL (нужно адаптировать):
-    # with conn.cursor() as cursor:
-    #     cursor.execute(
-    #         f"INSERT INTO {ORDERS_TABLE_NAME} (token, items_json, total_amount, status) VALUES (%s, %s, %s, %s)",
-    #         (order_token, items_json, total_amount, status)
-    #     )
-    # conn.commit()
-    
+    with conn.cursor() as cur:
+        cur.execute("""
+            INSERT INTO orders (order_token, status, cart_data, total_amount, created_at, updated_at)
+            VALUES (%s, 'pending_phone', %s, %s, NOW(), NOW())
+        """, (order_token, items_json, total_amount))
+    conn.commit()
     return order_token
 
-def update_order_status_and_user(conn, order_token: str, new_status: str, tg_id: int = None, phone_number: str = None, full_name: str = None, address: str = None) -> bool:
-    """ОБНОВЛЯЕТ статус заказа и добавляет данные пользователя по токену."""
+def get_order_by_token(conn, order_token):
+    """Получает данные заказа по токену."""
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM orders WHERE order_token = %s", (order_token,))
+        return cur.fetchone()
+
+def update_order_status_and_user(conn, order_token, new_status, **kwargs):
+    """
+    Обновляет статус заказа и любые переданные поля (tg_id, phone, name, address).
+    Использует **kwargs для гибкости.
+    """
+    fields = ["status = %s", "updated_at = NOW()"]
+    params = [new_status]
     
-    # !!! Здесь должна быть РЕАЛЬНАЯ ЛОГИКА обновления в базе данных !!!
-    print(f"STUB: Updating order {order_token} to status {new_status}. Data: TG={tg_id}, Phone={phone_number}, Name={full_name}, Address={address}")
-    # Пример SQL (нужно адаптировать):
-    # updates = []
-    # params = []
-    # if tg_id: updates.append("tg_id=%s"); params.append(tg_id)
-    # if phone_number: updates.append("phone_number=%s"); params.append(phone_number)
-    # if full_name: updates.append("full_name=%s"); params.append(full_name)
-    # if address: updates.append("address=%s"); params.append(address)
-    # updates.append("status=%s"); params.append(new_status)
-    # params.append(order_token)
+    if 'tg_id' in kwargs:
+        fields.append("user_tg_id = %s")
+        params.append(kwargs['tg_id'])
+        
+    if 'phone_number' in kwargs:
+        fields.append("phone_number = %s")
+        params.append(kwargs['phone_number'])
+        
+    if 'full_name' in kwargs:
+        fields.append("full_name = %s")
+        params.append(kwargs['full_name'])
+        
+    if 'address' in kwargs:
+        fields.append("address = %s")
+        params.append(kwargs['address'])
+        
+    # Добавляем токен в конец параметров для WHERE
+    params.append(order_token)
     
-    # if updates:
-    #     with conn.cursor() as cursor:
-    #         cursor.execute(f"UPDATE {ORDERS_TABLE_NAME} SET {', '.join(updates)} WHERE token=%s", params)
-    #     conn.commit()
+    sql = f"UPDATE orders SET {', '.join(fields)} WHERE order_token = %s"
     
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+    conn.commit()
     return True
 
-def get_order_by_token(conn, order_token: str):
-    """ВОЗВРАЩАЕТ order_data по токену."""
-    # !!! Здесь должна быть РЕАЛЬНАЯ ЛОГИКА получения данных из БД !!!
-    print(f"STUB: Fetching order data for token {order_token}")
-    # Пример: return (token, status, tg_id, items_json, ...)
-    return None 
+def get_user_state(conn, tg_id):
+    """Находит активный заказ пользователя (не завершенный)."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT order_token, status 
+            FROM orders 
+            WHERE user_tg_id = %s 
+              AND status NOT IN ('completed', 'cancelled', 'finalizing')
+            ORDER BY created_at DESC 
+            LIMIT 1
+        """, (tg_id,))
+        row = cur.fetchone()
+        
+    if row:
+        return row['order_token'], row['status']
+    return None
 
-def get_user_state(conn, tg_id: int):
-    """ВОЗВРАЩАЕТ order_token и status текущего активного заказа пользователя или None."""
-    # !!! Здесь должна быть РЕАЛЬНАЯ ЛОГИКА получения состояния пользователя !!!
-    # Пример: return ('1a2b3c4d', 'pending_phone')
-    return None 
 
-# --- ХЕНДЛЕРЫ ЛОГИКИ ТЕЛЕГРАМ ---
+# --- HANDLERS (ЛОГИКА) ---
 
-# 1. ОБРАБОТКА ИНИЦИАЦИИ ЗАКАЗА С САЙТА (POST /init-auth)
 def handle_init_auth(environ, start_response, conn):
+    """Обработка запроса с сайта: создание заказа."""
     try:
+        # Чтение тела запроса
         content_length = int(environ.get('CONTENT_LENGTH', 0))
-        request_body = environ['wsgi.input'].read(content_length)
-        data = json.loads(request_body)
+        body = environ['wsgi.input'].read(content_length)
+        data = json.loads(body)
 
+        # Сохранение в БД
         items = data.get('items', [])
-        total_amount = data.get('total_amount', 0)
+        total = data.get('total_amount', 0)
+        token = save_order_draft(conn, items, total)
         
-        # 1. Сохраняем черновик заказа
-        order_token = save_order_draft(conn, items, total_amount)
-        
-        # 2. Генерируем прямую deep-link ссылку
-        telegram_bot_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={order_token}"
+        # Генерация ссылки
+        bot_url = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start={token}"
 
-        response_data = {'order_token': order_token, 'telegram_bot_url': telegram_bot_url}
-        resp = json.dumps(response_data).encode('utf-8')
-        
+        # Ответ
+        resp = json.dumps({'telegram_bot_url': bot_url}).encode('utf-8')
         start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
         return [resp]
         
     except Exception as e:
-        print(f"Error in handle_init_auth: {e}")
-        start_response('500 Internal Server Error', CORS_HEADERS + [('Content-Type', 'application/json')])
-        return [json.dumps({'error': 'Failed to initialize order.'}).encode('utf-8')]
+        print(f"Init Auth Error: {e}")
+        start_response('500 Error', CORS_HEADERS + [('Content-Type', 'application/json')])
+        return [json.dumps({'error': str(e)}).encode('utf-8')]
 
-# 2. ОБРАБОТКА КОМАНДЫ /start
-def handle_start_command(conn, update):
-    message = update.get('message', {})
-    chat_id = message['chat']['id']
-    tg_id = message['from']['id']
+def handle_start_command(conn, chat_id, tg_id, text):
+    """Обработка команды /start <token>."""
+    # Ищем токен в сообщении (/start abc12345)
+    match = re.search(r'/start\s+([a-fA-F0-9]+)', text)
     
-    # Парсим deep-link токен
-    text = message.get('text', '')
-    match = re.match(r'/start\s+([a-fA-F0-9]{8})', text) # Ищем токен из 8 символов
-
     if match:
-        order_token = match.group(1)
-        order_data = get_order_by_token(conn, order_token) # Получаем данные заказа
-
-        if order_data and order_data.get('status') == 'pending_phone':
-            # Привязываем Telegram ID к заказу
-            update_order_status_and_user(conn, order_token, 'pending_phone', tg_id=tg_id)
+        token = match.group(1)
+        order = get_order_by_token(conn, token)
+        
+        if order and order['status'] == 'pending_phone':
+            # Привязываем юзера к заказу
+            update_order_status_and_user(conn, token, 'pending_phone', tg_id=tg_id)
             
-            # Клавиатура для запроса номера
-            reply_markup = {
-                "keyboard": [[{"text": "Поделиться контактом", "request_contact": True}]],
-                "one_time_keyboard": True,
-                "resize_keyboard": True
-            }
-            send_message(
-                chat_id, 
-                "Привет! Вы начали оформление заказа. Пожалуйста, подтвердите свой номер телефона, нажав на кнопку ниже:",
-                reply_markup=reply_markup
-            )
-            return
-
-    # Если токена нет или заказ не найден/неактивен
-    send_message(
-        chat_id, 
-        "Добро пожаловать в Oops Merch! Чтобы начать заказ, перейдите в корзину на нашем сайте и нажмите 'Оформить в Telegram'."
-    )
-    
-# 3. ОБРАБОТКА СООБЩЕНИЙ В БОТЕ (ФИО и Адрес)
-def handle_text_message(conn, update):
-    message = update.get('message', {})
-    chat_id = message['chat']['id']
-    text = message.get('text', '').strip()
-    tg_id = message['from']['id']
-
-    # Проверяем состояние пользователя по его активному заказу
-    order_state = get_user_state(conn, tg_id) 
-
-    if order_state:
-        order_token, status = order_state
-        
-        # Шаг 2: Ожидание ФИО
-        if status == 'pending_full_name':
-            if re.match(r'^[А-ЯЁа-яё\s]{5,}$', text, re.IGNORECASE) and len(text.split()) >= 2:
-                # Проверка: 2+ слова, только кириллица/пробелы, мин. длина
-                update_order_status_and_user(conn, order_token, 'pending_address', full_name=text)
-                
-                # Запрос адреса
-                send_message(
-                    chat_id, 
-                    "ФИО сохранено. Введите адрес (улица, дом, квартира). Мы сами найдем ближайший пункт доставки."
-                )
-            else:
-                send_message(chat_id, "⚠️ Пожалуйста, введите корректное ФИО (Иванов Иван Иванович).")
-            return
-        
-        # Шаг 3: Ожидание Адреса
-        elif status == 'pending_address':
-            if len(text) > 10:
-                update_order_status_and_user(conn, order_token, 'finalizing', address=text)
-                
-                # Переход к финализации/оплате
-                send_message(
-                    chat_id, 
-                    "✅ Адрес получен. Ваш заказ передан менеджеру для расчета доставки. \n\n"
-                    "Для уточнения или ускорения оформления, пожалуйста, напишите: **@oopssupport**"
-                )
-                send_admin_notification(order_token, "Заказ полностью оформлен клиентом через бота. Ожидает расчета доставки.")
-                
-            else:
-                send_message(chat_id, "⚠️ Пожалуйста, введите полный адрес для доставки.")
-            return
-
-    # Если это команда /start
-    if text.startswith('/start'):
-        handle_start_command(conn, update)
-    # Если не команда и нет активного заказа
+            kb = {"keyboard": [[{"text": "📱 Поделиться номером", "request_contact": True}]], "resize_keyboard": True, "one_time_keyboard": True}
+            send_message(chat_id, "👋 Привет! Мы нашли ваш заказ.\nДля продолжения, пожалуйста, подтвердите номер телефона:", kb)
+        else:
+            send_message(chat_id, "⚠️ Заказ не найден или уже оформлен.")
     else:
-        send_message(chat_id, "Чтобы оформить заказ, начните с корзины на сайте: [oops-merch.ru](https://oops-merch.ru)")
+        send_message(chat_id, "🛒 Чтобы оформить заказ, начните с корзины на сайте.")
 
-
-# 4. ОБРАБОТКА ПОДТВЕРЖДЕНИЯ НОМЕРА (КНОПКА contact)
-def handle_contact_share(conn, update):
-    message = update.get('message', {})
-    chat_id = message['chat']['id']
-    contact = message.get('contact', {})
-    tg_id = message['from']['id']
-
-    # Проверяем, что контакт принадлежит текущему пользователю и он соответствует ожидаемому шагу
+def handle_contact(conn, chat_id, tg_id, contact):
+    """Обработка получения контакта."""
     if contact.get('user_id') != tg_id:
-        send_message(chat_id, "⚠️ Пожалуйста, нажмите кнопку 'Поделиться контактом' сами, а не пересылайте чужой контакт.")
+        send_message(chat_id, "⛔️ Пожалуйста, отправьте СВОЙ контакт.")
         return
 
-    order_state = get_user_state(conn, tg_id) 
-
-    if order_state and order_state[1] == 'pending_phone':
-        order_token = order_state[0]
-        phone_number = contact.get('phone_number')
-
-        if phone_number:
-            # Обновляем статус на pending_full_name
-            update_order_status_and_user(conn, order_token, 'pending_full_name', phone_number=phone_number)
-            
-            # Переход к запросу ФИО
-            send_message(
-                chat_id, 
-                f"✅ **Номер +{phone_number} подтвержден!** Прекрасно, для продолжения введите свое ФИО (например, *Иванов Иван Иванович*)."
-            )
-        else:
-            send_message(chat_id, "⚠️ Не удалось получить ваш номер телефона.")
+    state = get_user_state(conn, tg_id)
+    if state and state[1] == 'pending_phone':
+        token = state[0]
+        phone = contact.get('phone_number')
+        
+        # Обновляем БД -> переходим к имени
+        update_order_status_and_user(conn, token, 'pending_full_name', phone_number=phone)
+        
+        send_message(chat_id, "✅ Номер принят!\n✍️ Теперь напишите ваше **ФИО** (например: Иванов Иван Иванович).", {"remove_keyboard": True})
     else:
-        send_message(chat_id, "⚠️ У вас нет активного заказа для подтверждения номера. Начните заказ на сайте.")
+        send_message(chat_id, "⚠️ Не найден активный заказ на этапе ввода номера.")
 
-# 5. ОБНОВЛЕННЫЙ WSGI/APP ENTRY POINT
+def handle_text(conn, chat_id, tg_id, text):
+    """Обработка текстовых сообщений (ФИО, Адрес)."""
+    if text.startswith('/start'):
+        handle_start_command(conn, chat_id, tg_id, text)
+        return
+
+    state = get_user_state(conn, tg_id)
+    if not state:
+        send_message(chat_id, "🤷‍♂️ Нет активного заказа. Перейдите на сайт.")
+        return
+
+    token, status = state
+
+    # Логика ФИО
+    if status == 'pending_full_name':
+        if len(text.split()) < 2 or len(text) < 5:
+            send_message(chat_id, "⚠️ Введите корректное ФИО (минимум 2 слова).")
+            return
+        
+        # Обновляем БД -> переходим к адресу
+        update_order_status_and_user(conn, token, 'pending_address', full_name=text)
+        send_message(chat_id, "👍 ФИО сохранено.\n🚚 Введите **полный адрес доставки** (Город, улица, дом, кв).")
+
+    # Логика АДРЕСА
+    elif status == 'pending_address':
+        if len(text) < 10:
+            send_message(chat_id, "⚠️ Адрес слишком короткий. Напишите подробнее.")
+            return
+            
+        # Обновляем БД -> Финал
+        update_order_status_and_user(conn, token, 'finalizing', address=text)
+        
+        final_msg = (
+            "✅ **Данные приняты!**\n\n"
+            "Менеджер скоро проверит стоимость доставки и свяжется с вами для оплаты.\n"
+            "Если нужно что-то уточнить, пишите: @oopssupport"
+        )
+        send_message(chat_id, final_msg)
+        send_admin_notification(token, f"Новый заказ завершен ботом!\nКлиент: {tg_id}\nАдрес: {text}")
+
+
+# --- WSGI ENTRY POINT ---
+
 def application(environ, start_response):
+    """Главная точка входа для Gunicorn."""
     conn = None
     try:
-        conn = get_db_connection()
         path = environ.get('PATH_INFO', '/')
-        request_method = environ.get('REQUEST_METHOD', 'GET')
-
-        # Обработка OPTIONS (CORS)
-        if request_method == 'OPTIONS':
+        method = environ.get('REQUEST_METHOD', 'GET')
+        
+        # OPTIONS (CORS preflight)
+        if method == 'OPTIONS':
             start_response('200 OK', CORS_HEADERS)
             return [b'']
         
-        # 1. ХЕНДЛЕР ИНИЦИАЦИИ ЗАКАЗА С САЙТА
-        if path == '/init-auth' and request_method == 'POST':
+        # Подключаемся к БД для обработки запроса
+        conn = get_db_connection()
+
+        # 1. Инициация заказа с сайта
+        if path == '/init-auth' and method == 'POST':
             return handle_init_auth(environ, start_response, conn)
-            
-        # 2. ОБРАБОТКА ВЕБХУКА ТЕЛЕГРАМ (ИСПРАВЛЕНИЕ IndentationError)
-        if path == f'/webhook/{TELEGRAM_BOT_TOKEN}' and request_method == 'POST':
+
+        # 2. Telegram Webhook
+        if path == f'/webhook/{TELEGRAM_BOT_TOKEN}' and method == 'POST':
             try:
-                content_length = int(environ.get('CONTENT_LENGTH', 0))
-                request_body = environ['wsgi.input'].read(content_length)
-                update = json.loads(request_body)
-
-                # Диспетчеризация сообщения:
-                if 'message' in update:
-                    message = update['message']
-                    if 'contact' in message:
-                        handle_contact_share(conn, update)
-                    elif 'text' in message:
-                        handle_text_message(conn, update)
+                length = int(environ.get('CONTENT_LENGTH', 0))
+                data = json.loads(environ['wsgi.input'].read(length))
                 
+                if 'message' in data:
+                    msg = data['message']
+                    chat_id = msg['chat']['id']
+                    tg_id = msg['from']['id']
+                    
+                    if 'contact' in msg:
+                        handle_contact(conn, chat_id, tg_id, msg['contact'])
+                    elif 'text' in msg:
+                        handle_text(conn, chat_id, tg_id, msg['text'])
+                        
             except Exception as e:
-                # Логирование, но всегда возвращаем 200, чтобы Телеграм не повторял запрос
-                print(f"Error handling Telegram webhook: {e}")
+                print(f"Webhook Logic Error: {e}")
             
-            # Телеграм должен всегда получать 200 ОК
-            start_response('200 OK', [('Content-type', 'text/plain')])
-            return [b'OK'] 
-            
-        # 3. УДАЛЕННЫЕ МАРШРУТЫ (STATUS, CDEK)
-        # if path.startswith('/status/'):
-        #     ... (логика удалена)
+            # Всегда 200 OK для Телеграма
+            start_response('200 OK', [('Content-Type', 'text/plain')])
+            return [b'OK']
 
-        # 4. 404
-        start_response('404 Not Found', [('Content-type', 'text/plain')])
+        # 404
+        start_response('404 Not Found', [('Content-Type', 'text/plain')])
         return [b'Not Found']
-        
+
     except Exception as e:
-        print(f"CRITICAL: {e}")
-        start_response('500 Error', [('Content-type', 'application/json')])
-        return [json.dumps({'error': str(e)}).encode('utf-8')]
+        print(f"Critical App Error: {e}")
+        start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
+        return [str(e).encode('utf-8')]
+        
     finally:
-        if conn: conn.close()
+        # Закрываем соединение с БД
+        if conn:
+            conn.close()
+й
