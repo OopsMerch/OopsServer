@@ -5,6 +5,7 @@ import psycopg2
 import psycopg2.errors
 import requests 
 from typing import Dict, Any
+import re # Добавлен для очистки токена
 
 # --- КОНФИГУРАЦИЯ ---
 DATABASE_URL = os.environ.get('DATABASE_URL')
@@ -70,11 +71,37 @@ def init_db(conn):
                     delivery_type VARCHAR(50) DEFAULT NULL,
                     delivery_address_data TEXT DEFAULT NULL,
                     admin_track_number VARCHAR(50) DEFAULT NULL,
-                    admin_delivery_date TEXT DEFAULT NULL, -- ИСПРАВЛЕНО: TEXT для гибкости
+                    admin_delivery_date TEXT DEFAULT NULL, 
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            
+            # --- РОБУСТНОЕ ИСПРАВЛЕНИЕ ОШИБКИ ДАТЫ (АВТОМАТИЧЕСКАЯ МИГРАЦИЯ) ---
+            try:
+                # 1. Проверяем текущий тип колонки
+                cur.execute(f"""
+                    SELECT data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = '{ORDERS_TABLE_NAME}' AND column_name = 'admin_delivery_date';
+                """)
+                result = cur.fetchone()
+                
+                # 2. Если тип не 'text' или 'character varying' (т.е. 'timestamp with time zone'), то меняем его
+                if result and result[0] not in ('text', 'character varying'):
+                    print(f"MIGRATION: Column admin_delivery_date is currently {result[0]}. Altering to TEXT.")
+                    # Используем USING для принудительной конвертации (превращаем старые данные в текст)
+                    cur.execute(f"""
+                        ALTER TABLE {ORDERS_TABLE_NAME} 
+                        ALTER COLUMN admin_delivery_date TYPE TEXT USING admin_delivery_date::TEXT;
+                    """)
+                    print("MIGRATION: admin_delivery_date successfully altered to TEXT.")
+            except psycopg2.errors.UndefinedTable:
+                # Таблица orders еще не создана, пропускаем
+                pass
+            except Exception as e:
+                print(f"MIGRATION ERROR (admin_delivery_date type fix): {e}")
+
             # Добавление недостающих колонок, если они не существуют
             def add_column_if_not_exists(col_name, col_type):
                 try:
@@ -82,12 +109,12 @@ def init_db(conn):
                 except psycopg2.errors.DuplicateColumn:
                     pass 
 
-            # ГЛАВНОЕ ИСПРАВЛЕНИЕ: УБЕРИТЕ TIMESTAMP ИСПОЛЬЗУЙТЕ TEXT
             add_column_if_not_exists('total_amount', 'NUMERIC(10, 2) NOT NULL DEFAULT 0.00')
             add_column_if_not_exists('delivery_type', 'VARCHAR(50) DEFAULT NULL')
             add_column_if_not_exists('delivery_address_data', 'TEXT DEFAULT NULL')
             add_column_if_not_exists('admin_track_number', 'VARCHAR(50) DEFAULT NULL')
-            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL') # ИСПРАВЛЕННЫЙ ТИП
+            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL') 
+
     except Exception as e:
         print(f"Database initialization error: {e}")
 
@@ -368,6 +395,16 @@ def handle_telegram_update(conn, update):
         try:
             order_token, track_number, pvz_address, delivery_date_str = parts
             
+            # --- УСИЛЕННАЯ ОЧИСТКА ТОКЕНА (для удаления префикса 'OOPS SUPPORT [24/7]: ') ---
+            if len(order_token) > 12:
+                # Ищем 12-значную последовательность букв и цифр (стандартный токен)
+                match = re.search(r'([0-9a-fA-F]{12})', order_token)
+                if match:
+                    order_token = match.group(1)
+                else:
+                    # Резервный вариант: если токен не найден, берем последнюю часть
+                    order_token = order_token.split(':')[-1].strip().split(' ')[-1].strip()
+
             # Ищем заказ по токену
             order_to_update = get_order_by_token(conn, order_token) 
 
@@ -401,8 +438,8 @@ def handle_telegram_update(conn, update):
                 return
 
         except Exception as e:
+            # Ошибка БД будет поймана здесь, но миграция в init_db должна ее исправить
             print(f"Admin input processing error: {e}")
-            # В случае ошибки логики/БД, сообщаем об этом, но просим придерживаться формата
             send_message(chat_id, f"⚠️ **Ошибка обработки данных:** `{str(e).splitlines()[0]}`. Проверьте формат:\n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
             return
     
@@ -476,7 +513,7 @@ def application(environ, start_response):
     conn = None
     try:
         conn = create_psql_connection()
-        init_db(conn) 
+        init_db(conn) # Вызываем миграцию при каждом обращении к серверу
         if method == 'OPTIONS':
             start_response('200 OK', CORS_HEADERS)
             return [b'']
