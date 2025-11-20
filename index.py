@@ -4,8 +4,6 @@ import uuid
 import psycopg2 
 import psycopg2.errors
 import requests 
-import hmac
-import hashlib 
 from typing import Dict, Any
 
 # --- КОНФИГУРАЦИЯ ---
@@ -13,13 +11,13 @@ DATABASE_URL = os.environ.get('DATABASE_URL')
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot') 
 
-# Очистка ID группы от мусора
+# Очистка ID группы от мусора (обязательно должно быть в формате -100...)
 raw_admin_id = os.environ.get('TG_ADMIN_GROUP_ID', '')
 TG_ADMIN_GROUP_ID = str(raw_admin_id).strip().replace("'", "").replace('"', "")
 
 ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
 
-# ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ
+# ПЕРЕМЕННЫЕ ДЛЯ ОПЛАТЫ (ваши реальные данные)
 SBERBANK_CARD = os.environ.get('SBERBANK_CARD', 'XXXX XXXX XXXX XXXX')
 TBANK_CARD = os.environ.get('TBANK_CARD', 'YYYY YYYY YYYY YYYY')
 ALFABANK_CARD = os.environ.get('ALFABANK_CARD', 'ZZZZ ZZZZ ZZZZ ZZZZ') 
@@ -57,6 +55,7 @@ def create_psql_connection():
 def init_db(conn):
     try:
         with conn.cursor() as cur:
+            # Создаем основную таблицу
             cur.execute(f"""
                 CREATE TABLE IF NOT EXISTS {ORDERS_TABLE_NAME} (
                     id SERIAL PRIMARY KEY,
@@ -71,22 +70,24 @@ def init_db(conn):
                     delivery_type VARCHAR(50) DEFAULT NULL,
                     delivery_address_data TEXT DEFAULT NULL,
                     admin_track_number VARCHAR(50) DEFAULT NULL,
-                    admin_delivery_date TEXT DEFAULT NULL,
+                    admin_delivery_date TEXT DEFAULT NULL, -- ИСПРАВЛЕНО: TEXT для гибкости
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+            # Добавление недостающих колонок, если они не существуют
             def add_column_if_not_exists(col_name, col_type):
                 try:
                     cur.execute(f"ALTER TABLE {ORDERS_TABLE_NAME} ADD COLUMN {col_name} {col_type};")
                 except psycopg2.errors.DuplicateColumn:
                     pass 
 
+            # ГЛАВНОЕ ИСПРАВЛЕНИЕ: УБЕРИТЕ TIMESTAMP ИСПОЛЬЗУЙТЕ TEXT
             add_column_if_not_exists('total_amount', 'NUMERIC(10, 2) NOT NULL DEFAULT 0.00')
             add_column_if_not_exists('delivery_type', 'VARCHAR(50) DEFAULT NULL')
             add_column_if_not_exists('delivery_address_data', 'TEXT DEFAULT NULL')
             add_column_if_not_exists('admin_track_number', 'VARCHAR(50) DEFAULT NULL')
-            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL')
+            add_column_if_not_exists('admin_delivery_date', 'TEXT DEFAULT NULL') # ИСПРАВЛЕННЫЙ ТИП
     except Exception as e:
         print(f"Database initialization error: {e}")
 
@@ -114,6 +115,7 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
         where_clause = "order_token = %s"
         params.append(order_token)
     elif filter_user_tg_id:
+        # Обновление только для активных заказов
         where_clause = f"user_tg_id = %s AND status IN ('{STATUS_PENDING_AUTH}', '{STATUS_PENDING_FULL_NAME}', '{STATUS_PENDING_ADDRESS}', '{STATUS_PENDING_DELIVERY_TYPE}', '{STATUS_PENDING_CONFIRMATION}')"
         params.append(filter_user_tg_id)
     else:
@@ -125,7 +127,6 @@ def update_order(conn, order_token=None, filter_user_tg_id=None, **kwargs):
         return cursor.rowcount > 0
 
 def get_order_by_tg_id(conn, user_tg_id):
-    print(f"DEBUG: Searching for active order for TG ID: {user_tg_id}") 
     query = f"""
     SELECT 
         order_token, status, total_amount, cart_data, phone_number, full_name, address, delivery_type, delivery_address_data, user_tg_id
@@ -144,9 +145,7 @@ def get_order_by_tg_id(conn, user_tg_id):
         if row:
             columns = [desc[0] for desc in cursor.description]
             result = dict(zip(columns, row))
-            print(f"DEBUG: Order found (Token: {result['order_token']}, Status: {result['status']})")
             return result
-        print(f"DEBUG: No active order found for TG ID: {user_tg_id}") 
         return None
         
 def get_order_by_token(conn, order_token):
@@ -168,7 +167,7 @@ def get_order_by_token(conn, order_token):
         return None
 
 
-# --- TELEGRAM UTILS (ИСПРАВЛЕНО ДЛЯ ОТЛАДКИ) ---
+# --- TELEGRAM UTILS ---
 
 def send_message(chat_id, text, reply_markup=None):
     url = TG_API_BASE + 'sendMessage'
@@ -181,7 +180,6 @@ def send_message(chat_id, text, reply_markup=None):
             
     try:
         response = requests.post(url, json=payload)
-        # ! ВАЖНО: Печатаем ответ от Telegram в логи !
         print(f"DEBUG: Telegram sending to {chat_id}. Status: {response.status_code}. Response: {response.text}")
     except Exception as e:
         print(f"Error sending message to {chat_id}: {e}")
@@ -198,7 +196,7 @@ def generate_admin_order_message(order_data):
     inline_keyboard = {
         "inline_keyboard": [
             [
-                {"text": "✅ Оформить (Админ)", "callback_data": f"admin_process_{order_data['order_token']}"}
+                {"text": "✅ Принять в обработку", "callback_data": f"admin_process_{order_data['order_token']}"}
             ]
         ]
     }
@@ -229,13 +227,10 @@ def generate_admin_order_message(order_data):
 def send_admin_order_notification(order_data):
     global TG_ADMIN_GROUP_ID 
     
-    print(f"DEBUG: Attempting to notify admin group: {TG_ADMIN_GROUP_ID}")
-
     if not TG_ADMIN_GROUP_ID or TG_ADMIN_GROUP_ID == 'YOUR_ADMIN_GROUP_ID':
          print("Warning: TG_ADMIN_GROUP_ID is not set.")
          return
 
-    # Пытаемся отправить как есть (строкой), так как Telegram ID может быть большим числом
     message, reply_markup = generate_admin_order_message(order_data)
     send_message(TG_ADMIN_GROUP_ID, message, reply_markup=reply_markup)
     
@@ -284,7 +279,8 @@ def handle_telegram_update(conn, update):
             order_data = get_order_by_token(conn, order_token)
             
             if order_data and order_data['status'] == STATUS_AWAITING_ADMIN: 
-                 response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
+                 # ОБНОВЛЕННЫЙ ТЕКСТ ПОДСКАЗКИ ДЛЯ АДМИНА
+                 response_text = f"✅ Заказ **{order_token}** принят в обработку. \n\n**Введите данные в формате:**\n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`"
                  edit_message_url = TG_API_BASE + 'editMessageText'
                  requests.post(edit_message_url, json={
                     'chat_id': chat_id,
@@ -352,30 +348,36 @@ def handle_telegram_update(conn, update):
     chat_id = message['chat']['id']
     text = message.get('text', '')
     
-    # Admin Logic Check
+    # Admin Logic Check (ОБНОВЛЕННАЯ ЛОГИКА)
     global TG_ADMIN_GROUP_ID, ADMIN_SUPPORT_USERNAME
-    print(f"DEBUG: Checking Admin match: '{chat_id}' vs '{TG_ADMIN_GROUP_ID}'")
-
+    
     if str(chat_id) == TG_ADMIN_GROUP_ID:
         print("DEBUG: Admin group detected. Parsing text...")
+        
+        # 1. Очистка текста: удаляем возможные префиксы (имя пользователя, цитаты) и берем только первую строку
+        clean_text = text.split('\n')[0].strip()
+        
+        # 2. Разбиваем на 4 части по разделителю '|'. limit=3 гарантирует, что все, что идет после 3-го '|', попадет в последнюю часть (дата)
+        parts = [x.strip() for x in clean_text.split('|', 3)]
+        
+        if len(parts) != 4:
+             print(f"DEBUG: Admin text format incorrect. Parts found: {len(parts)}. Text: {clean_text}")
+             send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
+             return 
+             
         try:
-            parts = [x.strip() for x in text.split('|')]
-            if len(parts) != 3:
-                 print("DEBUG: Admin text format incorrect. Ignoring.")
-                 return 
-            track_number, pvz_address, delivery_date_str = parts
-            order_to_update = None
-            with conn.cursor() as cur:
-                 cur.execute(f"SELECT order_token, user_tg_id, full_name, cart_data FROM {ORDERS_TABLE_NAME} WHERE status = %s ORDER BY updated_at DESC LIMIT 1;", (STATUS_AWAITING_ADMIN,))
-                 row = cur.fetchone()
-                 if row:
-                     columns = [desc[0] for desc in cur.description]
-                     order_to_update = dict(zip(columns, row))
+            order_token, track_number, pvz_address, delivery_date_str = parts
+            
+            # Ищем заказ по токену
+            order_to_update = get_order_by_token(conn, order_token) 
 
-            if order_to_update:
-                update_order(conn, order_token=order_to_update['order_token'], admin_track_number=track_number, delivery_address_data=pvz_address, admin_delivery_date=delivery_date_str, status=STATUS_COMPLETED)
+            if order_to_update and order_to_update['status'] == STATUS_AWAITING_ADMIN:
+                # Обновляем заказ и завершаем
+                # admin_delivery_date теперь TEXT, поэтому принимает любой ввод
+                update_order(conn, order_token=order_token, admin_track_number=track_number, delivery_address_data=pvz_address, admin_delivery_date=delivery_date_str, status=STATUS_COMPLETED)
+                
                 client_message = f"""
-✅ **Ваш заказ оформлен!** (Токен: `{order_to_update['order_token']}`)
+✅ **Ваш заказ оформлен!** (Токен: `{order_token}`)
 
 Вот **трек-номер**: `{track_number}`
 
@@ -389,14 +391,19 @@ def handle_telegram_update(conn, update):
 🔗 По всем вопросам к администратору: {ADMIN_SUPPORT_USERNAME}
 """
                 send_message(int(order_to_update['user_tg_id']), client_message)
-                send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_to_update['order_token']})")
+                send_message(chat_id, f"✅ Сообщение о доставке отправлено пользователю **{order_to_update['full_name']}** (Токен: {order_token})")
+                return
+            elif order_to_update and order_to_update['status'] != STATUS_AWAITING_ADMIN:
+                send_message(chat_id, f"⚠️ Заказ с токеном `{order_token}` найден, но он находится в статусе: **{order_to_update['status']}** (ожидается не 'ввод админа').")
                 return
             else:
-                send_message(chat_id, "⚠️ Не найден активный заказ в статусе 'Ожидает ввода'.")
+                send_message(chat_id, f"⚠️ Не найден активный заказ с токеном: `{order_token}`.")
                 return
+
         except Exception as e:
-            print(f"Admin input parsing error: {e}")
-            send_message(chat_id, "⚠️ **Неверный формат ввода.** Пожалуйста, используйте: \n`ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
+            print(f"Admin input processing error: {e}")
+            # В случае ошибки логики/БД, сообщаем об этом, но просим придерживаться формата
+            send_message(chat_id, f"⚠️ **Ошибка обработки данных:** `{str(e).splitlines()[0]}`. Проверьте формат:\n`ТОКЕН | ТРЕК_НОМЕР | АДРЕС_ПВЗ | ПРИМЕРНАЯ_ДАТА_ПОЛУЧЕНИЯ`")
             return
     
     # User Logic
@@ -405,11 +412,9 @@ def handle_telegram_update(conn, update):
     if 'contact' in message and order and order['status'] == STATUS_PENDING_AUTH:
         phone = message['contact']['phone_number']
         if update_order(conn, order_token=order['order_token'], phone_number=phone, status=STATUS_PENDING_FULL_NAME):
-            print(f"DEBUG: Order {order['order_token']} updated successfully with phone {phone}. Sending next prompt.") 
             remove_keyboard = {"remove_keyboard": True}
             send_message(chat_id, "✅ Телефон принят! Теперь введите ваше **ФИО** (Полностью):", reply_markup=remove_keyboard)
         else:
-            print(f"DEBUG: Order update FAILED for {order['order_token']} in PENDING_AUTH.") 
             send_message(chat_id, "⚠️ Ошибка обновления заказа. Попробуйте начать заново с сайта.", reply_markup={"remove_keyboard": True})
         return
 
@@ -418,7 +423,6 @@ def handle_telegram_update(conn, update):
         if len(params) > 1 and params[1].startswith('auth_'):
             order_token = params[1].replace('auth_', '')
             update_success = update_order(conn, order_token=order_token, filter_user_tg_id=None, user_tg_id=str(chat_id), status=STATUS_PENDING_AUTH)
-            print(f"DEBUG: START command received. Token: {order_token}. Update success: {update_success}") 
             if update_success:
                 keyboard = {"keyboard": [[{"text": "📱 Отправить номер телефона", "request_contact": True}]], "one_time_keyboard": True, "resize_keyboard": True}
                 send_message(chat_id, "👋 Привет! Мы получили ваш заказ.\nДля продолжения, пожалуйста, нажмите кнопку ниже, чтобы **подтвердить номер телефона**.", reply_markup=keyboard)
