@@ -498,4 +498,25 @@ def application(environ, start_response):
             link = f"https://t.me/{TELEGRAM_BOT_USERNAME}?start=auth_{token}"
             resp = json.dumps({'success': True, 'telegram_bot_url': link}).encode('utf-8')
             
-            start_response('200 OK', CORS_HEADERS + [('Content-
+            start_response('200 OK', CORS_HEADERS + [('Content-Type', 'application/json')])
+            return [resp]
+        except Exception as e:
+            logger.error(f"/init-auth error: {e}")
+            start_response('500 Error', CORS_HEADERS)
+            return [b'Error']
+
+    if method == 'POST' and path == '/webhook':
+        try:
+            size = int(environ.get('CONTENT_LENGTH', 0))
+            body = environ['wsgi.input'].read(size)
+            update = json.loads(body)
+            handle_telegram_update(update)
+            start_response('200 OK', [('Content-Type', 'text/plain')])
+            return [b'OK']
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            start_response('200 OK', [('Content-Type', 'text/plain')])
+            return [b'OK']
+
+    start_response('404 Not Found', [('Content-Type', 'text/plain')])
+    return [b'Not Found']
