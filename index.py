@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 import aiohttp
 
+# --- НАСТРОЙКИ ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FastAPIBot")
 
@@ -34,7 +35,9 @@ class Resources:
     client_session: aiohttp.ClientSession = None
 
 class DatabaseParams:
-    ORDERS_TABLE = 'orders'
+    # !!! МЫ СМЕНИЛИ ИМЯ ТАБЛИЦЫ, ЧТОБЫ СОЗДАТЬ ЕЁ ЗАНОВО С ПРАВИЛЬНЫМИ ТИПАМИ !!!
+    ORDERS_TABLE = 'orders_v2' 
+    
     ST_PENDING_AUTH = 'pending_phone_auth'
     ST_PENDING_NAME = 'pending_full_name'
     ST_PENDING_ADDR = 'pending_address'
@@ -51,6 +54,7 @@ class Database:
     async def init_db():
         if not Resources.db_pool: return
         async with Resources.db_pool.acquire() as conn:
+            # Создаем таблицу с VARCHAR для ID, чтобы влезали любые цифры
             await conn.execute(f"""
                 CREATE TABLE IF NOT EXISTS {DatabaseParams.ORDERS_TABLE} (
                     id SERIAL PRIMARY KEY,
@@ -69,51 +73,69 @@ class Database:
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 );
-                CREATE INDEX IF NOT EXISTS idx_order_token ON {DatabaseParams.ORDERS_TABLE} (order_token);
-                CREATE INDEX IF NOT EXISTS idx_user_tg_id ON {DatabaseParams.ORDERS_TABLE} (user_tg_id);
+                CREATE INDEX IF NOT EXISTS idx_order_token_v2 ON {DatabaseParams.ORDERS_TABLE} (order_token);
+                CREATE INDEX IF NOT EXISTS idx_user_tg_id_v2 ON {DatabaseParams.ORDERS_TABLE} (user_tg_id);
             """)
 
     @staticmethod
     async def save_draft(token, cart, total):
-        async with Resources.db_pool.acquire() as conn:
-            await conn.execute(
-                f"INSERT INTO {DatabaseParams.ORDERS_TABLE} (order_token, status, cart_data, total_amount) VALUES ($1, $2, $3, $4)",
-                token, DatabaseParams.ST_PENDING_AUTH, json.dumps(cart), total
-            )
+        try:
+            async with Resources.db_pool.acquire() as conn:
+                await conn.execute(
+                    f"INSERT INTO {DatabaseParams.ORDERS_TABLE} (order_token, status, cart_data, total_amount) VALUES ($1, $2, $3, $4)",
+                    str(token), DatabaseParams.ST_PENDING_AUTH, json.dumps(cart), float(total)
+                )
+        except Exception as e:
+            logger.error(f"Save Draft Error: {e}")
+            raise e
 
     @staticmethod
     async def get_order(token=None, tg_id=None):
-        async with Resources.db_pool.acquire() as conn:
-            if token:
-                row = await conn.fetchrow(f"SELECT * FROM {DatabaseParams.ORDERS_TABLE} WHERE order_token = $1 LIMIT 1", token)
-            elif tg_id:
-                row = await conn.fetchrow(
-                    f"SELECT * FROM {DatabaseParams.ORDERS_TABLE} WHERE user_tg_id = $1 AND status != $2 ORDER BY created_at DESC LIMIT 1",
-                    str(tg_id), DatabaseParams.ST_COMPLETED
-                )
-            else:
-                return None
-            return dict(row) if row else None
+        try:
+            async with Resources.db_pool.acquire() as conn:
+                if token:
+                    row = await conn.fetchrow(f"SELECT * FROM {DatabaseParams.ORDERS_TABLE} WHERE order_token = $1 LIMIT 1", str(token))
+                elif tg_id:
+                    # Приводим tg_id к строке принудительно
+                    row = await conn.fetchrow(
+                        f"SELECT * FROM {DatabaseParams.ORDERS_TABLE} WHERE user_tg_id = $1 AND status != $2 ORDER BY created_at DESC LIMIT 1",
+                        str(tg_id), DatabaseParams.ST_COMPLETED
+                    )
+                else:
+                    return None
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Get Order Error: {e}")
+            return None
 
     @staticmethod
     async def update_order(order_token, **kwargs):
         if not kwargs: return False
+        
         set_parts = ["updated_at = CURRENT_TIMESTAMP"]
         values = []
         i = 1
+        
         for key, value in kwargs.items():
             set_parts.append(f"{key} = ${i}")
             if key == 'cart_data' and isinstance(value, (dict, list)):
                 values.append(json.dumps(value))
+            elif key == 'user_tg_id':
+                # ПРИНУДИТЕЛЬНО В СТРОКУ, чтобы не было ошибки Integer
+                values.append(str(value))
             else:
                 values.append(value)
             i += 1
-        values.append(order_token)
+            
+        values.append(str(order_token))
         query = f"UPDATE {DatabaseParams.ORDERS_TABLE} SET {', '.join(set_parts)} WHERE order_token = ${i}"
+        
         try:
             async with Resources.db_pool.acquire() as conn:
                 result = await conn.execute(query, *values)
-                return True if result and "UPDATE" in result else False
+                if result and "UPDATE" in result:
+                    return True
+                return False
         except Exception as e:
             logger.error(f"Update Error: {e}")
             return False
@@ -155,6 +177,7 @@ class BotLogic:
     async def notify_admin(order):
         if not Config.TG_ADMIN_GROUP_ID: return
         cart_data = json.loads(order['cart_data']) if isinstance(order['cart_data'], str) else order['cart_data']
+        
         txt = (
             f"🔥 **НОВЫЙ ЗАКАЗ ОПЛАЧЕН** 🔥\n"
             f"ID: `{order['order_token']}`\n\n"
@@ -188,10 +211,13 @@ class BotLogic:
         if data.startswith('admin_process_'):
             token = data.split('_')[-1]
             order = await Database.get_order(token=token)
+            
             if order and order['status'] == DatabaseParams.ST_AWAIT_ADMIN:
                 await Database.update_order(token, status=DatabaseParams.ST_ADMIN_PROC)
+                
                 clean_text = cb['message']['text'].split('👇')[0].strip()
                 await TelegramClient.edit_message(chat_id, msg_id, clean_text + '\n\n✅ **ВЗЯТ В РАБОТУ**', {})
+                
                 instr = (
                     f"✅ **В обработке** `{token}`\n\n"
                     f"🛠 **Доступные команды для работы с заказами:**\n"
@@ -209,8 +235,10 @@ class BotLogic:
             order = await Database.get_order(tg_id=chat_id)
             if order and order['status'] == DatabaseParams.ST_ARRIVED:
                 await Database.update_order(order['order_token'], status=DatabaseParams.ST_REVIEW)
+                
                 orig_text = cb['message']['text'].split('Пожалуйста, нажмите кнопку ниже')[0].strip()
                 await TelegramClient.edit_message(chat_id, msg_id, orig_text + '\n\n✅ **Получено**', None)
+                
                 review_req = (
                     "🥳 **Ура! Поздравляем с покупкой!**\n\n"
                     "Нам будет очень приятно, если вы оставите отзыв с фото.\n"
@@ -224,17 +252,21 @@ class BotLogic:
         chat_id = msg['chat']['id']
         text = msg.get('text', '').strip()
         
+        # --- АДМИН ПАНЕЛЬ ---
         if str(chat_id) == str(Config.TG_ADMIN_GROUP_ID):
             if '|' in text:
                 parts = [x.strip() for x in text.split('|')]
                 token = parts[0]
                 order = await Database.get_order(token=token)
+                
                 if not order:
                     await TelegramClient.send_message(chat_id, f"⚠️ Заказ с токеном `{token}` не найден.")
                     return
+
                 if len(parts) == 4 and order['status'] == DatabaseParams.ST_ADMIN_PROC:
                     track, pvz, date = parts[1], parts[2], parts[3]
                     await Database.update_order(token, admin_track_number=track, delivery_address_data=pvz, admin_delivery_date=date, status=DatabaseParams.ST_SHIPPING)
+                    
                     user_msg = (
                         f"🚀 **Заказ сформирован!**\n\n"
                         f"📦 **Трек-номер:** `{track}`\n"
@@ -245,8 +277,10 @@ class BotLogic:
                     )
                     await TelegramClient.send_message(int(order['user_tg_id']), user_msg)
                     await TelegramClient.send_message(chat_id, f"✅ Трек отправлен клиенту (Заказ `{token}`)")
+                
                 elif len(parts) == 2 and parts[1].upper() in ['ARRIVED', 'ПРИБЫЛ'] and order['status'] == DatabaseParams.ST_SHIPPING:
                     await Database.update_order(token, status=DatabaseParams.ST_ARRIVED)
+                    
                     user_msg = (
                         f"🏃 **Ваш заказ прибыл!**\n\n"
                         f"Он ждет вас в пункте выдачи: {order['delivery_address_data']}\n\n"
@@ -258,11 +292,15 @@ class BotLogic:
                     await TelegramClient.send_message(chat_id, f"✅ Клиент оповещен о прибытии (Заказ `{token}`)")
             return
 
+        # --- ЮЗЕР ---
         if text.startswith('/start'):
             params = text.split()
             if len(params) > 1 and params[1].startswith('auth_'):
                 token = params[1].replace('auth_', '')
+                
+                # Попытка привязать
                 success = await Database.update_order(token, user_tg_id=str(chat_id), status=DatabaseParams.ST_PENDING_AUTH)
+                
                 if success:
                     kb = {"keyboard": [[{"text": "📱 Отправить номер", "request_contact": True}]], "one_time_keyboard": True, "resize_keyboard": True}
                     welcome_msg = (
@@ -278,7 +316,9 @@ class BotLogic:
                 await TelegramClient.send_message(chat_id, f"👋 Привет! Если есть вопросы, пиши нам: {Config.ADMIN_SUPPORT_USERNAME}")
                 return
 
+        # ПОИСК ЗАКАЗА
         order = await Database.get_order(tg_id=chat_id)
+        
         if not order:
             if 'contact' in msg or (text and re.match(r'^\+?\d{10,15}$', re.sub(r'[^\d+]', '', text))):
                  await TelegramClient.send_message(chat_id, f"⚠️ Нет активного заказа. Оформите корзину на {Config.SITE_URL}")
@@ -292,9 +332,11 @@ class BotLogic:
         if st == DatabaseParams.ST_PENDING_AUTH:
             phone = msg.get('contact', {}).get('phone_number') or text
             phone = re.sub(r'[^\d+]', '', phone)
+            
             if len(phone) >= 10:
                 if phone.startswith('8'): phone = '+7' + phone[1:]
                 elif not phone.startswith('+'): phone = '+' + phone
+                
                 await Database.update_order(token, phone_number=phone, status=DatabaseParams.ST_PENDING_NAME)
                 await TelegramClient.send_message(chat_id, "✅ Номер принят.\n\nПожалуйста, отправьте ваше **ФИО полным сообщением**:", reply_markup={"remove_keyboard": True})
             else:
@@ -314,7 +356,9 @@ class BotLogic:
                 await TelegramClient.send_message(chat_id, "⚠️ Адрес слишком короткий.")
                 return
             await Database.update_order(token, address=text, delivery_type='СДЭК', status=DatabaseParams.ST_PENDING_PAY)
+            
             updated_order = await Database.get_order(token=token)
+            
             pay_msg = (
                 f"💳 **Оплата заказа**\n\n"
                 f"К оплате: **{updated_order['total_amount']:.2f} ₽**\n\n"
@@ -332,6 +376,7 @@ class BotLogic:
                 await Database.update_order(token, status=DatabaseParams.ST_AWAIT_ADMIN)
                 await BotLogic.notify_admin(order)
                 await TelegramClient.forward_message(chat_id, msg['message_id'], Config.TG_ADMIN_GROUP_ID)
+                
                 success_msg = (
                     "✅ **Спасибо, чек принят!**\n\n"
                     "Мы проверяем оплату. Как только заказ пройдет ручную модерацию - бот автоматически пришлет трек-номер и остальную информацию. Спасибо, что выбрали нас🫶"
@@ -351,6 +396,7 @@ class BotLogic:
                 await TelegramClient.send_message(chat_id, "Спасибо! Заказ завершен.")
             return
 
+# --- KEEP ALIVE ---
 async def keep_alive_ping():
     url = Config.APP_URL
     if not url: return
@@ -363,16 +409,22 @@ async def keep_alive_ping():
         except Exception:
             pass
 
+# --- ЗАПУСК ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     if not Config.DATABASE_URL:
         logger.critical("DATABASE_URL NOT FOUND")
         raise RuntimeError("DATABASE_URL not set")
+    
     Resources.db_pool = await asyncpg.create_pool(Config.DATABASE_URL, min_size=1, max_size=20)
     await Database.init_db()
+    
     Resources.client_session = aiohttp.ClientSession()
     asyncio.create_task(keep_alive_ping())
+    
+    logger.info("🚀 Bot Started (ASGI) & Keep-Alive Active")
     yield
+    
     if Resources.db_pool: await Resources.db_pool.close()
     if Resources.client_session: await Resources.client_session.close()
 
