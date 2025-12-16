@@ -3,8 +3,9 @@ import json
 import uuid
 import re
 import logging
+import asyncio
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI, Request, Response, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import asyncpg
 import aiohttp
@@ -16,27 +17,26 @@ class Config:
     
     # Telegram
     TG_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-    if not TG_BOT_TOKEN:
-        # Логируем, но не падаем сразу, чтобы дать серверу запуститься и показать ошибку в логах
-        print("CRITICAL: TELEGRAM_BOT_TOKEN is missing!")
-        
     TG_API_BASE = f'https://api.telegram.org/bot{TG_BOT_TOKEN}/'
     TG_BOT_USERNAME = os.environ.get('TELEGRAM_BOT_USERNAME', 'oopsmerchbot')
     
-    # ID чатов (строки)
+    # ID чатов
     TG_ADMIN_GROUP_ID = os.environ.get('TG_ADMIN_GROUP_ID')
     TG_REVIEWS_CHANNEL_ID = os.environ.get('TG_REVIEWS_CHANNEL_ID')
     
     # Тексты и ссылки
     ADMIN_SUPPORT_USERNAME = os.environ.get('ADMIN_SUPPORT_USERNAME', '@oopssupport')
-    # Используем SITE_BASE_URL как SITE_URL
     SITE_URL = os.environ.get('SITE_BASE_URL', 'oops-merch.ru')
     
+    # URL самого приложения для Keep-Alive (Render URL)
+    # Render автоматически ставит RENDER_EXTERNAL_URL
+    APP_URL = os.environ.get('RENDER_EXTERNAL_URL') 
+
     # Реквизиты
     CARDS = {
-        'sber': os.environ.get('SBERBANK_CARD'),
-        'tbank': os.environ.get('TBANK_CARD'),
-        'alfa': os.environ.get('ALFABANK_CARD')
+        'sber': os.environ.get('SBERBANK_CARD', '2202203614486217'),
+        'tbank': os.environ.get('TBANK_CARD', '2200702039512418'),
+        'alfa': os.environ.get('ALFABANK_CARD', '2200154572801271')
     }
 
 # --- 2. ЛОГИРОВАНИЕ ---
@@ -51,7 +51,6 @@ class Resources:
 # --- 4. БАЗА ДАННЫХ ---
 class DatabaseParams:
     ORDERS_TABLE = 'orders'
-    # Статусы
     ST_PENDING_AUTH = 'pending_phone_auth'
     ST_PENDING_NAME = 'pending_full_name'
     ST_PENDING_ADDR = 'pending_address'
@@ -121,7 +120,7 @@ class Database:
 
     @staticmethod
     async def update_order(order_token, **kwargs):
-        if not kwargs: return
+        if not kwargs: return False
         
         set_parts = ["updated_at = CURRENT_TIMESTAMP"]
         values = []
@@ -140,9 +139,14 @@ class Database:
         
         try:
             async with Resources.db_pool.acquire() as conn:
-                await conn.execute(query, *values)
+                result = await conn.execute(query, *values)
+                # result string example: "UPDATE 1"
+                if result and "UPDATE" in result:
+                    return True
+                return False
         except Exception as e:
             logger.error(f"Update Error: {e}")
+            return False
 
 # --- 5. TELEGRAM API ---
 class TelegramClient:
@@ -158,6 +162,8 @@ class TelegramClient:
     @staticmethod
     async def send_message(chat_id, text, reply_markup=None):
         payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'Markdown'}
+        # ВАЖНО: Отключаем превью ссылок, чтобы не забивать чат
+        payload['disable_web_page_preview'] = True
         if reply_markup: payload['reply_markup'] = reply_markup
         await TelegramClient._post('sendMessage', payload)
 
@@ -177,21 +183,27 @@ class BotLogic:
     @staticmethod
     def _generate_cart_text(cart_items):
         if isinstance(cart_items, str): cart_items = json.loads(cart_items)
-        return "\n".join([f"▫️ {item['name']} ({item['size']}) x {item['quantity']}" for item in cart_items])
+        return "\n".join([f"▫️ {item['name']} (Размер: {item['size']}) x {item['quantity']}" for item in cart_items])
 
     @staticmethod
     async def notify_admin(order):
         if not Config.TG_ADMIN_GROUP_ID: return
         cart_data = json.loads(order['cart_data']) if isinstance(order['cart_data'], str) else order['cart_data']
         
+        # ТОЧНЫЙ ТЕКСТ ДЛЯ АДМИНА
         txt = (
-            f"🔥 **НОВЫЙ ЗАКАЗ ОПЛАЧЕН** 🔥\nID: `{order['order_token']}`\n\n"
-            f"💰 **{order['total_amount']:.2f} ₽**\n"
-            f"👤 {order['full_name']} (`{order['phone_number']}`)\n"
-            f"TG: [ID {order['user_tg_id']}](tg://user?id={order['user_tg_id']})\n"
-            f"🚚 Адрес: `{order['address']}`\n\n"
+            f"🔥 **НОВЫЙ ЗАКАЗ ОПЛАЧЕН** 🔥\n"
+            f"ID: `{order['order_token']}`\n\n"
+            f"💰 **Сумма:** {order['total_amount']:.2f} ₽\n\n"
+            f"👤 **Покупатель:**\n"
+            f"ФИО: {order['full_name']}\n"
+            f"Тел: `{order['phone_number']}`\n"
+            f"TG: [ID {order['user_tg_id']}](tg://user?id={order['user_tg_id']})\n\n"
+            f"🚚 **Доставка:**\n"
+            f"Куда: {order['address'] or 'Адрес не указан'} \n"
+            f"Тип: СДЭК (по умолчанию)\n\n"
             f"🛒 **Товары:**\n{BotLogic._generate_cart_text(cart_data)}\n\n"
-            f"👇 **ЧЕК НИЖЕ:**"
+            f"👇 **ЧЕК ОБ ОПЛАТЕ НИЖЕ:**"
         )
         kb = {"inline_keyboard": [[{"text": "🛠 Взять в работу", "callback_data": f"admin_process_{order['order_token']}"}]]}
         await TelegramClient.send_message(Config.TG_ADMIN_GROUP_ID, txt, kb)
@@ -209,137 +221,264 @@ class BotLogic:
         msg_id = cb['message']['message_id']
         data = cb['data']
         
+        # --- АДМИН: Взять в работу ---
         if data.startswith('admin_process_'):
             token = data.split('_')[-1]
             order = await Database.get_order(token=token)
             
             if order and order['status'] == DatabaseParams.ST_AWAIT_ADMIN:
                 await Database.update_order(token, status=DatabaseParams.ST_ADMIN_PROC)
+                
+                # Обрезаем исходное сообщение, убираем чек и добавляем статус
                 clean_text = cb['message']['text'].split('👇')[0].strip()
                 await TelegramClient.edit_message(chat_id, msg_id, clean_text + '\n\n✅ **ВЗЯТ В РАБОТУ**', {})
                 
+                # Инструкция админу (ТОЧНЫЙ ТЕКСТ)
                 instr = (
-                    f"✅ **В работе** `{token}`\n\n"
-                    f"1. Трек: `{token} | ТРЕК | АДРЕС ПВЗ | ДАТА`\n"
-                    f"2. Прибыл: `{token} | ПРИБЫЛ`"
+                    f"✅ **В обработке** `{token}`\n\n"
+                    f"🛠 **Доступные команды для работы с заказами:**\n"
+                    f"1. **Отправка трека:** `{token} | ТРЕК-НОМЕР | ПВЗ АДРЕС | ДАТА ДОСТАВКИ`\n"
+                    f"   _(Пример: `b83a1602884a | 4772747272 | Мира 146 | ~18 декабря`)_\n"
+                    f"2. **Отметка о прибытии:** `{token} | ПРИБЫЛ`\n"
+                    f"   _(Клиенту будет отправлено уведомление с кнопкой 'Я забрал(а)')_"
                 )
                 await TelegramClient.send_message(chat_id, instr)
             elif order:
-                await TelegramClient.edit_message(chat_id, msg_id, cb['message']['text'] + '\n\n⚠️ **УЖЕ ВЗЯТ**', {})
+                await TelegramClient.edit_message(chat_id, msg_id, cb['message']['text'] + '\n\n⚠️ **ЗАКАЗ УЖЕ ВЗЯТ В РАБОТУ**', {})
             return
 
+        # --- ЮЗЕР: Получил заказ ---
         if data == 'user_received_order':
             order = await Database.get_order(tg_id=chat_id)
             if order and order['status'] == DatabaseParams.ST_ARRIVED:
                 await Database.update_order(order['order_token'], status=DatabaseParams.ST_REVIEW)
-                await TelegramClient.edit_message(chat_id, msg_id, cb['message']['text'].split('👇')[0] + '\n\n✅ **Получено**', None)
-                await TelegramClient.send_message(chat_id, "🥳 **Ура!**\nЖдем ваш отзыв (фото+текст) прямо здесь!")
+                
+                # Меняем сообщение с кнопкой на "✅ Получено"
+                orig_text = cb['message']['text'].split('Пожалуйста, нажмите кнопку ниже')[0].strip()
+                await TelegramClient.edit_message(chat_id, msg_id, orig_text + '\n\n✅ **Получено**', None)
+                
+                # Текст просьбы отзыва
+                review_req = (
+                    "🥳 **Ура! Поздравляем с покупкой!**\n\n"
+                    "Нам будет очень приятно, если вы оставите отзыв с фото.\n"
+                    "Это поможет нам стать лучше, а другим - сделать выбор.\n\n"
+                    "📸 Пожалуйста, отправьте текст отзыва (можно приложить фотографию) в этот чат, и бот автоматически перешлет его в канал с отзывами!"
+                )
+                await TelegramClient.send_message(chat_id, review_req)
 
     @staticmethod
     async def _process_message(msg):
         chat_id = msg['chat']['id']
         text = msg.get('text', '').strip()
         
-        # --- АДМИН ---
+        # --- АДМИН ПАНЕЛЬ ---
         if str(chat_id) == str(Config.TG_ADMIN_GROUP_ID):
             if '|' in text:
                 parts = [x.strip() for x in text.split('|')]
                 token = parts[0]
                 order = await Database.get_order(token=token)
-                if not order: return
+                
+                if not order:
+                    await TelegramClient.send_message(chat_id, f"⚠️ Заказ с токеном `{token}` не найден.")
+                    return
 
+                # Отправка трека
                 if len(parts) == 4 and order['status'] == DatabaseParams.ST_ADMIN_PROC:
                     track, pvz, date = parts[1], parts[2], parts[3]
                     await Database.update_order(token, admin_track_number=track, delivery_address_data=pvz, admin_delivery_date=date, status=DatabaseParams.ST_SHIPPING)
                     
-                    user_msg = f"🚀 **Заказ отправлен!**\n\n📦 Трек: `{track}`\n🏢 ПВЗ: {pvz}\n⏳ Дата: {date}"
+                    # Сообщение КЛИЕНТУ
+                    user_msg = (
+                        f"🚀 **Заказ сформирован!**\n\n"
+                        f"📦 **Трек-номер:** `{track}`\n"
+                        f"🏢 **Пункт выдачи:** {pvz}\n"
+                        f"⏳ **Примерная дата получения:** {date}\n\n"
+                        f"Мы оповестим вас, когда товар прибудет🤝\n"
+                        f"Связь - {Config.ADMIN_SUPPORT_USERNAME}"
+                    )
                     await TelegramClient.send_message(int(order['user_tg_id']), user_msg)
-                    await TelegramClient.send_message(chat_id, f"✅ Трек отправлен клиенту ({token})")
+                    
+                    # Сообщение АДМИНУ
+                    await TelegramClient.send_message(chat_id, f"✅ Трек отправлен клиенту (Заказ `{token}`)")
                 
+                # Прибытие
                 elif len(parts) == 2 and parts[1].upper() in ['ARRIVED', 'ПРИБЫЛ'] and order['status'] == DatabaseParams.ST_SHIPPING:
                     await Database.update_order(token, status=DatabaseParams.ST_ARRIVED)
-                    user_msg = f"🏃 **Заказ прибыл!**\n\nПВЗ: {order['delivery_address_data']}\nКод в приложении СДЭК.\n\n👇 Нажмите, когда заберете!"
-                    kb = {"inline_keyboard": [[{"text": "📦 Я забрал(а)!", "callback_data": "user_received_order"}]]}
+                    
+                    # Сообщение КЛИЕНТУ
+                    user_msg = (
+                        f"🏃 **Ваш заказ прибыл!**\n\n"
+                        f"Он ждет вас в пункте выдачи: {order['delivery_address_data']}\n\n"
+                        f"Код для получения находится в личном кабинете СДЭК. Для входа используйте номер, который вы использовали для оформления заказа.\n\n"
+                        f"Пожалуйста, нажмите кнопку ниже, когда заберете посылку 👇"
+                    )
+                    kb = {"inline_keyboard": [[{"text": "📦 Я забрал(а) заказ!", "callback_data": "user_received_order"}]]}
                     await TelegramClient.send_message(int(order['user_tg_id']), user_msg, reply_markup=kb)
-                    await TelegramClient.send_message(chat_id, f"✅ Клиент уведомлен о прибытии ({token})")
+                    
+                    # Сообщение АДМИНУ
+                    await TelegramClient.send_message(chat_id, f"✅ Клиент оповещен о прибытии (Заказ `{token}`)")
             return
 
         # --- ЮЗЕР ---
+        
+        # 1. СТАРТ / АВТОРИЗАЦИЯ
         if text.startswith('/start'):
             params = text.split()
             if len(params) > 1 and params[1].startswith('auth_'):
                 token = params[1].replace('auth_', '')
-                await Database.update_order(token, user_tg_id=str(chat_id), status=DatabaseParams.ST_PENDING_AUTH)
-                kb = {"keyboard": [[{"text": "📱 Отправить телефон", "request_contact": True}]], "one_time_keyboard": True, "resize_keyboard": True}
-                await TelegramClient.send_message(chat_id, "👋 Привет! Нажмите кнопку внизу, чтобы подтвердить номер.", reply_markup=kb)
+                
+                # Пытаемся привязать заказ
+                success = await Database.update_order(token, user_tg_id=str(chat_id), status=DatabaseParams.ST_PENDING_AUTH)
+                
+                if success:
+                    kb = {"keyboard": [[{"text": "📱 Отправить номер", "request_contact": True}]], "one_time_keyboard": True, "resize_keyboard": True}
+                    welcome_msg = (
+                        "👋 **Добро пожаловать в Oops Merch!**\n\n"
+                        "Для оформления заказа нам нужен ваш номер телефона.\n"
+                        "Нажмите на кнопку внизу или отправьте номер вручную."
+                    )
+                    await TelegramClient.send_message(chat_id, welcome_msg, reply_markup=kb)
+                else:
+                    await TelegramClient.send_message(chat_id, "⚠️ Ссылка устарела или недействительна. Попробуйте оформить корзину на сайте заново.")
+                
+                # ВАЖНО: Делаем return, чтобы код не пошел дальше проверять "активный заказ" и не выдал ошибку
+                return
             else:
-                await TelegramClient.send_message(chat_id, f"👋 Поддержка: {Config.ADMIN_SUPPORT_USERNAME}")
-            return
+                # Просто /start без токена
+                await TelegramClient.send_message(chat_id, f"👋 Привет! Если есть вопросы, пиши нам: {Config.ADMIN_SUPPORT_USERNAME}")
+                return
 
+        # 2. ПОИСК ЗАКАЗА
         order = await Database.get_order(tg_id=chat_id)
+        
+        # Если заказа нет
         if not order:
-            if 'contact' in msg or (text and re.match(r'^\+?\d+$', text)):
+            # Проверка: если юзер пытается ввести номер или контакт, но заказа нет
+            if 'contact' in msg or (text and re.match(r'^\+?\d{10,15}$', re.sub(r'[^\d+]', '', text))):
                  await TelegramClient.send_message(chat_id, f"⚠️ Нет активного заказа. Оформите корзину на {Config.SITE_URL}")
+                 return
+            
+            # Иначе дефолт
+            await TelegramClient.send_message(chat_id, f"⚠️ Нет активного заказа. Оформите корзину на {Config.SITE_URL}")
             return
 
         st = order['status']
         token = order['order_token']
 
+        # 3. ТЕЛЕФОН
         if st == DatabaseParams.ST_PENDING_AUTH:
             phone = msg.get('contact', {}).get('phone_number') or text
             phone = re.sub(r'[^\d+]', '', phone)
+            
             if len(phone) >= 10:
+                # Форматируем номер
+                if phone.startswith('8'): phone = '+7' + phone[1:]
+                elif not phone.startswith('+'): phone = '+' + phone
+                
                 await Database.update_order(token, phone_number=phone, status=DatabaseParams.ST_PENDING_NAME)
-                await TelegramClient.send_message(chat_id, "✅ Пришлите **ФИО** (одним сообщением).", reply_markup={"remove_keyboard": True})
+                await TelegramClient.send_message(chat_id, "✅ **Номер принят.**\n\nПожалуйста, отправьте ваше **ФИО полным сообщением**:", reply_markup={"remove_keyboard": True})
+            else:
+                await TelegramClient.send_message(chat_id, "⚠️ Неверный формат номера. Пожалуйста, отправьте номер в формате `+7 (XXX) XXX-XX-XX` или нажмите кнопку.")
             return
 
+        # 4. ФИО
         if st == DatabaseParams.ST_PENDING_NAME:
             if len(text.split()) < 2:
-                await TelegramClient.send_message(chat_id, "⚠️ Нужно минимум два слова (Имя и Фамилия).")
+                await TelegramClient.send_message(chat_id, "⚠️ Пожалуйста, введите Фамилию и Имя (минимум 2 слова).")
                 return
             await Database.update_order(token, full_name=text, status=DatabaseParams.ST_PENDING_ADDR)
-            await TelegramClient.send_message(chat_id, "📍 Введите **Адрес** (Город, Улица, Дом).")
+            await TelegramClient.send_message(chat_id, "📍 Введите ваш **адрес проживания** (Город, Улица, Дом, Квартира).\n\nМы подберем ближайший СДЭК к этому адресу.")
             return
 
+        # 5. АДРЕС -> ОПЛАТА
         if st == DatabaseParams.ST_PENDING_ADDR:
-            if len(text) < 5: return
+            if len(text) < 5: 
+                await TelegramClient.send_message(chat_id, "⚠️ Адрес слишком короткий.")
+                return
             await Database.update_order(token, address=text, delivery_type='СДЭК', status=DatabaseParams.ST_PENDING_PAY)
             
+            # Получаем обновленные данные (цену)
+            updated_order = await Database.get_order(token=token)
+            
             pay_msg = (
-                f"💳 **К оплате: {order['total_amount']:.2f} ₽**\n\n"
+                f"💳 **Оплата заказа**\n\n"
+                f"К оплате: **{updated_order['total_amount']:.2f} ₽**\n\n"
+                f"Перевод на одну из карт:\n"
                 f"🟢 Сбер: `{Config.CARDS['sber']}`\n"
-                f"🟡 Т-Банк: `{Config.CARDS['tbank']}`\n"
+                f"🟡 Тинькофф: `{Config.CARDS['tbank']}`\n"
                 f"🔴 Альфа: `{Config.CARDS['alfa']}`\n\n"
-                f"📎 **ОБЯЗАТЕЛЬНО:** Пришлите ФАЙЛ чека сюда."
+                f"📎 **ОБЯЗАТЕЛЬНО:** Пришлите **ФАЙЛ (Квитанцию/PDF)** с чеком сюда."
             )
             await TelegramClient.send_message(chat_id, pay_msg)
             return
 
+        # 6. ЧЕК
         if st == DatabaseParams.ST_PENDING_PAY:
             if 'document' in msg or 'photo' in msg:
                 await Database.update_order(token, status=DatabaseParams.ST_AWAIT_ADMIN)
+                # Уведомление админу
                 await BotLogic.notify_admin(order)
+                # Форвард чека админу
                 await TelegramClient.forward_message(chat_id, msg['message_id'], Config.TG_ADMIN_GROUP_ID)
-                await TelegramClient.send_message(chat_id, "✅ Чек принят! Ожидайте подтверждения.")
+                
+                success_msg = (
+                    "✅ **Спасибо, чек принят!**\n\n"
+                    "Мы проверяем оплату. Как только заказ пройдет ручную модерацию - бот автоматически пришлет трек-номер и остальную информацию. Спасибо, что выбрали нас🫶"
+                )
+                await TelegramClient.send_message(chat_id, success_msg)
+            else:
+                await TelegramClient.send_message(chat_id, "⏳ Ждем файл с квитанцией об оплате.")
             return
 
+        # 7. ОТЗЫВ
         if st == DatabaseParams.ST_REVIEW:
-            if Config.TG_REVIEWS_CHANNEL_ID:
+            if Config.TG_REVIEWS_CHANNEL_ID and (text or 'photo' in msg or 'document' in msg):
                 await TelegramClient.forward_message(chat_id, msg['message_id'], Config.TG_REVIEWS_CHANNEL_ID)
-            await Database.update_order(token, status=DatabaseParams.ST_COMPLETED)
-            await TelegramClient.send_message(chat_id, "🖤 Спасибо за отзыв! Заказ завершен.")
+                await Database.update_order(token, status=DatabaseParams.ST_COMPLETED)
+                await TelegramClient.send_message(chat_id, "🖤 **Спасибо за отзыв!**\n\nБудем рады видеть вас снова!")
+            else:
+                # Если нажали что-то другое
+                await Database.update_order(token, status=DatabaseParams.ST_COMPLETED)
+                await TelegramClient.send_message(chat_id, "🖤 Спасибо за заказ! Будем рады видеть вас снова!")
             return
 
-# --- 7. ЗАПУСК ПРИЛОЖЕНИЯ ---
+# --- 8. KEEP ALIVE (Анти-сон) ---
+async def keep_alive_ping():
+    """Пингует сам себя каждые 10 минут, чтобы Render не засыпал"""
+    url = Config.APP_URL
+    if not url:
+        logger.warning("No RENDER_EXTERNAL_URL found. Keep-alive disabled.")
+        return
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{url}/health") as resp:
+                    logger.info(f"Keep-Alive Ping: {resp.status}")
+        except Exception as e:
+            logger.error(f"Keep-Alive Error: {e}")
+        
+        # Ждем 10 минут (600 секунд)
+        await asyncio.sleep(600)
+
+# --- 9. ЗАПУСК ПРИЛОЖЕНИЯ ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # 1. Start DB
     if Config.DATABASE_URL:
         Resources.db_pool = await asyncpg.create_pool(Config.DATABASE_URL, min_size=1, max_size=20)
         await Database.init_db()
     
+    # 2. Start Session
     Resources.client_session = aiohttp.ClientSession()
-    logger.info("🚀 Bot Started")
+    
+    # 3. Start Keep-Alive Task
+    asyncio.create_task(keep_alive_ping())
+    
+    logger.info("🚀 Bot Started & Keep-Alive Active")
     yield
+    
+    # Shutdown
     if Resources.db_pool: await Resources.db_pool.close()
     if Resources.client_session: await Resources.client_session.close()
 
@@ -349,6 +488,10 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 @app.get("/")
 async def root():
     return "FastAPI Bot Running"
+
+@app.get("/health")
+async def health():
+    return "OK"
 
 @app.post("/init-auth")
 async def init_auth(request: Request):
